@@ -1,0 +1,14 @@
+[package]
+name = "raptun-fec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RaptorQ forward-error-correction layer for Raptun: encoder, receiver block-manager state machine, adaptive repair strategy, and in-flight repair budget."
+
+[dependencies]
+raptun-proto = { path = "../raptun-proto" }
+raptorq.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

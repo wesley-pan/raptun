@@ -1,0 +1,17 @@
+[package]
+name = "raptun-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Raptun wire protocol: control messages and datagram header codec."
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+# Optional serde derives on the control messages, handy for config/debug dumps.
+# The on-wire codec itself is hand-rolled (see codec.rs) and does not need serde.
+serde_support = ["dep:serde"]

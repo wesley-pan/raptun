@@ -1,0 +1,41 @@
+# Example Raptun client configuration.
+#
+# Precedence when a value is set in multiple places:
+#   CLI flag  >  environment variable  >  this file  >  built-in default
+#
+# Pass with:  raptun-client -c raptun-client.example.toml
+
+localaddr   = "127.0.0.1:12948"
+remoteaddr  = "vps.example.com:29900"
+listen_mode = "tcp"                       # tcp | socks5
+
+# Application-level auth (NOT encryption; QUIC/TLS already encrypts).
+# The "env:" prefix pulls the value from the named environment variable so the
+# secret is not stored in plaintext.
+psk         = "env:RAPTUN_PSK"
+
+# Trust-on-first-use: pin the server's self-signed cert fingerprint.
+fingerprint = "SHA256:a1b2c3d4e5f6..."
+sni         = "raptun"
+
+[fec]
+scheme      = "raptorq"                    # off | raptorq | xor
+mode        = "adaptive"                   # adaptive | fixed
+ratio       = 0.15                         # used only when mode = "fixed"
+min         = 0.02                         # adaptive lower bound
+max         = 0.50                         # adaptive upper bound
+symbol_size = 1200
+# block_size = 64                          # omit for auto (derive from RTT)
+
+[transport]
+cc            = "bbr"                       # bbr | cubic | newreno
+mtu           = 1350
+datagram      = true                       # false => reliable streams, FEC off
+stream_rwnd   = 2097152                     # 2 MiB
+conn_rwnd     = 16777216                    # 16 MiB
+sockbuf       = 4194304                     # 4 MiB
+keepalive     = 10                          # seconds; 0 disables
+idle_timeout  = 30
+migration     = true
+zero_rtt      = true
+dscp          = 0

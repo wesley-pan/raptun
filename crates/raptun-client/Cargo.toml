@@ -1,0 +1,22 @@
+[package]
+name = "raptun-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Raptun client: local TCP/SOCKS5 acceptor that tunnels connections to a Raptun server over QUIC + RaptorQ FEC."
+
+[[bin]]
+name = "raptun-client"
+path = "src/main.rs"
+
+[dependencies]
+raptun-core = { path = "../raptun-core" }
+raptun-fec = { path = "../raptun-fec" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true

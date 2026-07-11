@@ -1,0 +1,34 @@
+[package]
+name = "raptun-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Raptun core: Quinn endpoint/TLS setup, session manager, and the bridge between transport telemetry and the FEC layer."
+
+[dependencies]
+raptun-proto = { path = "../raptun-proto" }
+raptun-fec = { path = "../raptun-fec" }
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+hex.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+
+[features]
+# Exposes deterministic datagram-loss injection for integration tests. Never
+# enable in production; it can silently drop traffic.
+test-hooks = []
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+raptun-fec = { path = "../raptun-fec" }
+raptun-proto = { path = "../raptun-proto" }

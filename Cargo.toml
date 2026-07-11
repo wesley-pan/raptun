@@ -1,0 +1,58 @@
+# Raptun workspace.
+#
+# Raptun = RaptorQ + QUIC tunnel. A next-generation replacement for kcptun-style
+# tunnels (yamux-over-KCP): native QUIC multiplexing (Quinn) instead of the
+# two-layer yamux+KCP stack, plus RaptorQ forward-error-correction on the
+# unreliable-datagram path for latency-optimized loss recovery.
+#
+# Crate layout (dependencies flow downward, no cycles):
+#
+#   raptun-proto  -- wire messages: control-protocol enums + datagram header codec
+#   raptun-fec    -- RaptorQ wrapper: encoder, receiver block-manager state
+#                    machine, adaptive repair strategy, in-flight budget
+#   raptun-core   -- Quinn endpoint/TLS, session manager, stream+datagram plumbing
+#   raptun-client -- local TCP/SOCKS5 acceptor + CLI  (depends on core)
+#   raptun-server -- target forwarder + CLI            (depends on core)
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/raptun-proto",
+    "crates/raptun-fec",
+    "crates/raptun-core",
+    "crates/raptun-client",
+    "crates/raptun-server",
+]
+
+# Shared dependency versions. Individual crates opt in via `foo.workspace = true`.
+# NOTE (Phase 1): the versions below are indicative. Pin them against the real
+# published APIs when the scaffold is first compiled — quinn's datagram/stats
+# surface and raptorq's encoder/decoder types are the two to verify first.
+[workspace.dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rcgen = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+raptorq = "2"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
