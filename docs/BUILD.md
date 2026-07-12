@@ -179,5 +179,30 @@ smaller binary.
 | `error: failed to run custom build command for ring` / `perl … not found` | Perl missing | install Perl (see per-OS sections) |
 | linker / `cc`/`cl.exe` not found | no C toolchain | install build-essential / Xcode CLT / VS Build Tools |
 | `error: package requires rustc 1.75` | toolchain too old | `rustup update` |
+| `could not compile tokio … (signal: 9, SIGKILL)` | **out of memory** — the Linux OOM killer killed rustc (common on 1-2 GB VMs; the default `release` LTO makes it worse) | build with the memory-lean profile: `cargo build --profile release-lean`; or limit parallelism `cargo build -j 2`; or add swap. See below. |
 | `netem_bench.sh` prints "tc netem is Linux-only" | running on macOS/Windows | use `cargo test … --test netem`, or WSL2/Linux |
 | test hangs at a `--features test-hooks` e2e | leftover binaries holding a port | `pkill -9 -f raptun` then retry |
+
+### Low-memory build hosts
+
+The default `release` profile uses thin LTO + a single codegen unit for a
+faster, smaller binary, but that pushes rustc's peak memory high — on small VMs
+or memory-limited containers the Linux OOM killer terminates rustc with
+`SIGKILL` (`signal: 9`). Use the memory-lean profile, which disables LTO and
+raises codegen-units to cap peak memory (identical behavior, binary is slightly
+larger / marginally slower):
+
+```bash
+cargo build --profile release-lean     # → target/release-lean/raptun-{client,server}
+```
+
+Other levers, in order of preference:
+
+```bash
+cargo build -j 2                        # debug build, limit parallel rustc jobs
+# or add swap (for ~1-2 GB machines):
+sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+```
+
+To confirm it really was OOM: `dmesg | grep -iE "killed process|out of memory"`.

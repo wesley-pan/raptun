@@ -56,3 +56,17 @@ rust-version = "1.75"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Memory-lean release profile for constrained build hosts (small VMs /
+# containers). The default `release` profile uses thin LTO + a single codegen
+# unit, which pushes the rustc peak memory high enough to trigger the Linux OOM
+# killer (SIGKILL) on ~1-2 GB machines. This profile disables LTO and raises
+# codegen-units to cap peak memory, trading a slightly larger / marginally
+# slower binary for a build that fits. Behavior is identical.
+#   cargo build --profile release-lean
+# Output lives in target/release-lean/.
+[profile.release-lean]
+inherits = "release"
+lto = false
+codegen-units = 16
+
