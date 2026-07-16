@@ -50,16 +50,16 @@ rustc --version   # verify >= 1.75
 | `x86_64-unknown-linux-gnu` | 🟢 expected | primary deployment target; also where `netem_bench.sh` runs |
 | `aarch64-unknown-linux-gnu` | 🟢 expected | |
 | `x86_64-unknown-linux-musl` | 🟢 expected (static) | needs `musl-gcc`; see below |
-| `x86_64-pc-windows-msvc` | 🟢 expected | needs VS Build Tools; see below |
+| `x86_64-pc-windows-msvc` | ✅ **built & tested here** | Rust 1.97.0 + VS Build Tools 18 (MSVC 14.51); all 44 default + 46 `test-hooks` tests pass, `cargo fmt --check` clean |
 | `*-pc-windows-gnu` | 🟡 likely | MinGW toolchain; less exercised |
 | `wasm32-*` | ❌ unsupported | `quinn-udp` needs real UDP sockets; the tunnel is inherently networked |
 | `no_std` | ❌ unsupported (binaries) | client/server need `std` + tokio. `raptun-proto`/`raptun-fec` are `std`-oriented here too |
 
 "Expected" means the code is portable Rust with no OS-specific `cfg` in Raptun's
 own crates (only its dependencies branch on OS), so it should build once the
-platform toolchain below is present. Only `aarch64-apple-darwin` has been
-compiled and tested in this repo to date — treat other rows as "should work,
-verify on first build."
+platform toolchain below is present. `aarch64-apple-darwin` and
+`x86_64-pc-windows-msvc` have both been compiled and tested in this repo —
+treat the remaining rows as "should work, verify on first build."
 
 ## macOS
 
@@ -113,19 +113,35 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Windows
 
-Use the MSVC toolchain (recommended):
+Verified host (`x86_64-pc-windows-msvc`). Use the MSVC toolchain (recommended):
 
 1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
    with the "Desktop development with C++" workload (provides the MSVC `cl.exe`
-   linker that `ring` needs).
-2. Install Perl — [Strawberry Perl](https://strawberryperl.com/) is the usual
-   choice; ensure `perl` is on `PATH`.
+   linker that `ring` needs). Verified with Build Tools 18 / MSVC 14.51.
+2. Install Perl and ensure `perl` is on `PATH`. [Strawberry Perl](https://strawberryperl.com/)
+   is the usual standalone choice, but the `perl` that ships with **Cygwin or
+   MSYS2/Git-Bash also works** for `ring`'s build script — verified here with
+   Cygwin's `perl` on `PATH`.
 3. Install Rust via rustup (defaults to `x86_64-pc-windows-msvc`).
 
 ```powershell
 cargo build --release
 cargo test --features test-hooks
 ```
+
+rustc locates the MSVC linker automatically (via `vswhere`/registry), so a
+plain `cargo build` works from an ordinary shell once the Build Tools are
+installed — you do not need to launch a "Developer" prompt or run `vcvars`.
+
+Verified on this host: Rust 1.97.0 (stable, `x86_64-pc-windows-msvc`), VS Build
+Tools 18 (MSVC 14.51), Cygwin `perl` 5.42 — `cargo build`, `cargo test`
+(44 passing), `cargo test --features test-hooks` (46 passing), and
+`cargo fmt --all -- --check` (clean) all succeed. Note: `cargo clippy` on
+newer toolchains (1.97) surfaces a handful of lint warnings — mostly in
+`crates/raptun-core/tests/netem.rs` (dead fields, too-many-args) and an
+elidable lifetime in `raptun-proto` — that were clean on the toolchain the code
+was originally developed against; they are lint-strictness drift, not build
+failures.
 
 `netem_bench.sh` is a bash script and will not run natively; use WSL2 (a real
 Linux kernel, so `tc netem` works there) or the portable `cargo test … netem`.
