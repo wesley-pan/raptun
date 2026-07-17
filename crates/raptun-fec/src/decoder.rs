@@ -100,6 +100,13 @@ pub struct BlockManager {
     k: u32,
     /// Distinct symbols received so far.
     received: u32,
+    /// Repair symbols currently reserved against the shared [`RepairBudget`] on
+    /// this block's behalf (non-zero only while a NACK is outstanding). Tracked
+    /// so the reservation is released on *every* exit from `NackSent` — the block
+    /// decoding, a repair symbol arriving, or the NACK timing out — not just the
+    /// timeout path. Leaking it would monotonically exhaust the budget and force
+    /// every later block onto the slow reliable-retransmit fallback.
+    reserved: u32,
     /// When the first symbol for this block arrived (start of the grace clock).
     first_symbol_at: Option<Instant>,
     state: State,
@@ -125,6 +132,7 @@ impl BlockManager {
             block_id,
             k,
             received: 0,
+            reserved: 0,
             first_symbol_at: None,
             state: State::Filling,
             codec,
@@ -141,7 +149,19 @@ impl BlockManager {
 
     /// Feed a received symbol. If it completes the block, transitions to `Done`
     /// and returns [`DecoderAction::Deliver`].
-    pub fn on_symbol(&mut self, now: Instant, esi: u32, payload: &[u8]) -> DecoderAction {
+    ///
+    /// `budget` is the shared repair budget: any reservation this block made for
+    /// an outstanding NACK is released here, because a symbol arriving is exactly
+    /// the signal that the reservation is no longer in flight — whether it
+    /// completes the block or just makes progress. Releasing on these success
+    /// paths (not only on NACK timeout) is what keeps the budget from leaking.
+    pub fn on_symbol(
+        &mut self,
+        now: Instant,
+        esi: u32,
+        payload: &[u8],
+        budget: &RepairBudget,
+    ) -> DecoderAction {
         if self.is_terminal() {
             return DecoderAction::Idle;
         }
@@ -149,16 +169,29 @@ impl BlockManager {
         self.received += 1;
 
         if let Some(bytes) = self.codec.add_symbol(esi, payload) {
+            self.release_reservation(budget);
             self.state = State::Done;
             return DecoderAction::Deliver { bytes };
         }
 
         // A repair symbol arriving while we were waiting on a NACK returns us to
-        // plain filling — the arbitration in `tick` will re-run if we stall again.
+        // plain filling — the arbitration in `tick` will re-run if we stall
+        // again. Release the reservation: this symbol is the arrival the NACK was
+        // waiting for, so it is no longer in flight.
         if let State::NackSent { .. } = self.state {
+            self.release_reservation(budget);
             self.state = State::Filling;
         }
         DecoderAction::Idle
+    }
+
+    /// Return any outstanding repair reservation to the shared budget. Idempotent:
+    /// clears `reserved` so it can only be released once.
+    fn release_reservation(&mut self, budget: &RepairBudget) {
+        if self.reserved > 0 {
+            budget.release(self.reserved);
+            self.reserved = 0;
+        }
     }
 
     /// Periodic arbitration. Call on a timer (e.g. every few ms) for every
@@ -223,6 +256,7 @@ impl BlockManager {
         // Budget is the hard brake. If the repair we'd request doesn't fit under
         // the in-flight ceiling, fall back rather than pile on more redundancy.
         if ctx.budget.try_reserve(need) {
+            self.reserved = need;
             self.state = State::NackSent {
                 requested: need,
                 at: ctx.now,
@@ -245,9 +279,7 @@ impl BlockManager {
         // degrade, rather than requesting yet more repair.
         let waited = ctx.now.saturating_duration_since(sent_at);
         if waited > ctx.link.smoothed_rtt() && self.received < self.k {
-            if let State::NackSent { requested, .. } = self.state {
-                ctx.budget.release(requested);
-            }
+            self.release_reservation(ctx.budget);
             self.state = State::Stalled { since: sent_at };
             return self.tick_stalled(ctx);
         }
@@ -281,14 +313,24 @@ mod tests {
         BlockManager::new(1, k, Box::new(FakeCodec { k, seen: 0 }))
     }
 
+    /// A permissive budget for `on_symbol` calls in tests that are not
+    /// exercising the budget itself (feeding symbols never reserves; it only
+    /// releases, and releasing against a fresh budget is a harmless no-op).
+    fn noop_budget() -> RepairBudget {
+        let b = RepairBudget::new(1200, 0.4);
+        b.refresh_ceiling(1_000_000);
+        b
+    }
+
     #[test]
     fn happy_path_decodes_without_nack() {
         let mut m = mgr(3);
         let t0 = Instant::now();
-        assert_eq!(m.on_symbol(t0, 0, b"a"), DecoderAction::Idle);
-        assert_eq!(m.on_symbol(t0, 1, b"b"), DecoderAction::Idle);
+        let b = noop_budget();
+        assert_eq!(m.on_symbol(t0, 0, b"a", &b), DecoderAction::Idle);
+        assert_eq!(m.on_symbol(t0, 1, b"b", &b), DecoderAction::Idle);
         assert!(matches!(
-            m.on_symbol(t0, 2, b"c"),
+            m.on_symbol(t0, 2, b"c", &b),
             DecoderAction::Deliver { .. }
         ));
         assert!(m.is_terminal());
@@ -301,9 +343,9 @@ mod tests {
         // so we must not stall yet.
         let mut m = mgr(5);
         let t0 = Instant::now();
-        m.on_symbol(t0, 0, b"a");
         let budget = RepairBudget::new(1200, 0.4);
         budget.refresh_ceiling(1_000_000);
+        m.on_symbol(t0, 0, b"a", &budget);
         let link = LinkState::for_test(Duration::from_millis(50), 0.1, LossRegime::Random);
 
         let ctx = TickCtx {
@@ -322,10 +364,10 @@ mod tests {
     fn genuine_stall_sends_nack_then_budget_exhaustion_degrades() {
         let mut m = mgr(10);
         let t0 = Instant::now();
-        m.on_symbol(t0, 0, b"a"); // received = 1, need = 9
-
         let budget = RepairBudget::new(1200, 0.4);
         budget.refresh_ceiling(1_000_000); // plenty
+        m.on_symbol(t0, 0, b"a", &budget); // received = 1, need = 9
+
         let link = LinkState::for_test(Duration::from_millis(50), 0.2, LossRegime::Random);
         let ctx = TickCtx {
             now: t0 + Duration::from_secs(1),
@@ -337,9 +379,9 @@ mod tests {
 
         // A fresh block that stalls when the budget is empty must degrade.
         let mut m2 = mgr(10);
-        m2.on_symbol(t0, 0, b"a");
         let tight = RepairBudget::new(1200, 0.4);
         tight.refresh_ceiling(0); // ceiling 0 ⇒ nothing fits
+        m2.on_symbol(t0, 0, b"a", &tight);
         let ctx2 = TickCtx {
             now: t0 + Duration::from_secs(1),
             link: &link,
@@ -353,9 +395,9 @@ mod tests {
     fn congestion_regime_degrades_without_nack() {
         let mut m = mgr(10);
         let t0 = Instant::now();
-        m.on_symbol(t0, 0, b"a");
         let budget = RepairBudget::new(1200, 0.4);
         budget.refresh_ceiling(1_000_000);
+        m.on_symbol(t0, 0, b"a", &budget);
         let congested = LinkState::for_test(Duration::from_millis(50), 0.2, LossRegime::Congestion);
         let ctx = TickCtx {
             now: t0 + Duration::from_secs(1),
@@ -375,9 +417,9 @@ mod tests {
         // NACKs; the point is that it no longer waits indefinitely.
         let mut m = mgr(10);
         let t0 = Instant::now();
-        m.on_symbol(t0, 0, b"a"); // 1 of 10, far from decodable
         let budget = RepairBudget::new(1200, 0.4);
         budget.refresh_ceiling(1_000_000);
+        m.on_symbol(t0, 0, b"a", &budget); // 1 of 10, far from decodable
         let link = LinkState::for_test(Duration::from_millis(50), 0.2, LossRegime::Random);
 
         // Just past the jitter grace but with no later block: must NOT stall.
@@ -397,5 +439,72 @@ mod tests {
             later_blocks_progressing: false,
         };
         assert_eq!(m.tick(&late), DecoderAction::SendNack { have: 1, need: 9 });
+    }
+
+    /// Regression: a NACK reservation must be returned to the shared budget when
+    /// the repair actually arrives (decode) — not only on NACK timeout. A leak
+    /// here monotonically exhausts the budget and forces every subsequent block
+    /// onto the slow reliable-retransmit path.
+    #[test]
+    fn budget_is_released_when_repair_decodes_the_block() {
+        let k = 10;
+        let mut m = mgr(k);
+        let t0 = Instant::now();
+        // Tight budget: exactly enough for one NACK of `need` symbols.
+        let budget = RepairBudget::new(1200, 1.0);
+        // Feed one symbol, then stall and NACK to reserve `need = k - 1`.
+        m.on_symbol(t0, 0, b"a", &budget);
+        // Ceiling large enough to admit the reservation.
+        budget.refresh_ceiling(1200 * u64::from(k));
+        let link = LinkState::for_test(Duration::from_millis(50), 0.2, LossRegime::Random);
+        let ctx = TickCtx {
+            now: t0 + Duration::from_secs(1),
+            link: &link,
+            budget: &budget,
+            later_blocks_progressing: true,
+        };
+        let need = k - 1;
+        assert_eq!(m.tick(&ctx), DecoderAction::SendNack { have: 1, need });
+        assert_eq!(budget.in_flight(), u64::from(need), "reservation is held");
+
+        // Repair arrives and completes the block: reservation must be released.
+        for esi in 1..k {
+            let action = m.on_symbol(t0, esi, b"x", &budget);
+            if let DecoderAction::Deliver { .. } = action {
+                break;
+            }
+        }
+        assert!(m.is_terminal(), "block decoded");
+        assert_eq!(
+            budget.in_flight(),
+            0,
+            "budget must be fully released on decode, not leaked"
+        );
+    }
+
+    /// Regression: releasing on a mid-flight repair arrival (block returns to
+    /// Filling without decoding) also frees the reservation.
+    #[test]
+    fn budget_is_released_when_repair_arrives_without_decoding() {
+        let k = 10;
+        let mut m = mgr(k);
+        let t0 = Instant::now();
+        let budget = RepairBudget::new(1200, 1.0);
+        m.on_symbol(t0, 0, b"a", &budget);
+        budget.refresh_ceiling(1200 * u64::from(k));
+        let link = LinkState::for_test(Duration::from_millis(50), 0.2, LossRegime::Random);
+        let ctx = TickCtx {
+            now: t0 + Duration::from_secs(1),
+            link: &link,
+            budget: &budget,
+            later_blocks_progressing: true,
+        };
+        assert!(matches!(m.tick(&ctx), DecoderAction::SendNack { .. }));
+        assert!(budget.in_flight() > 0);
+        // One more symbol arrives (still short of k): NackSent -> Filling, and the
+        // reservation is released even though the block did not decode.
+        let action = m.on_symbol(t0, 1, b"x", &budget);
+        assert_eq!(action, DecoderAction::Idle);
+        assert_eq!(budget.in_flight(), 0, "reservation freed on repair arrival");
     }
 }

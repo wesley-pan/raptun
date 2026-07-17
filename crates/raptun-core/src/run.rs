@@ -360,6 +360,9 @@ async fn run_fec_tunnel(
     let (nack_tx, mut nack_rx) = mpsc::unbounded_channel::<(u64, u32)>();
     // Peer's announced total block count, routed to the downstream task.
     let (count_tx, mut count_rx) = mpsc::unbounded_channel::<u64>();
+    // Peer's running high-water block count, routed to the downstream task so it
+    // can recover entirely-lost blocks even when no later block follows.
+    let (hw_tx, mut hw_rx) = mpsc::unbounded_channel::<u64>();
     // Reliable-retransmit requests routed to the upstream task (which owns the
     // sender and its retained block payloads).
     let (rel_req_tx, mut rel_req_rx) = mpsc::unbounded_channel::<u64>();
@@ -396,6 +399,9 @@ async fn run_fec_tunnel(
                 match sig {
                     TunnelSignal::BlockCount { total } => {
                         let _ = count_tx.send(total);
+                    }
+                    TunnelSignal::HighWater { blocks } => {
+                        let _ = hw_tx.send(blocks);
                     }
                     TunnelSignal::Nack { block, need, .. } => {
                         let _ = nack_tx.send((block, need));
@@ -441,6 +447,14 @@ async fn run_fec_tunnel(
                         }
                         total_blocks += 1;
                     }
+                    // Announce the running high-water mark on the reliable stream
+                    // so the receiver learns these blocks exist even if every one
+                    // of their datagrams is lost and no later block follows (the
+                    // interactive request/response stall). Cheap: one small frame
+                    // per burst, not per block.
+                    let _ = up_sig.send(TunnelSignal::HighWater {
+                        blocks: total_blocks,
+                    });
                 }
                 // Serve an inbound NACK: mint fresh repair for the named block.
                 Some((block, need)) = nack_rx.recv() => {
@@ -509,7 +523,7 @@ async fn run_fec_tunnel(
                 sym = inbound.recv() => {
                     match sym {
                         Some((block_id, esi, payload)) => {
-                            let out = receiver.on_symbol(block_id, esi, &payload, Instant::now());
+                            let out = receiver.on_symbol(block_id, esi, &payload, Instant::now(), &budget);
                             if !out.is_empty() {
                                 tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
                             }
@@ -522,6 +536,12 @@ async fn run_fec_tunnel(
                     // Let the receiver detect entirely-lost blocks against the
                     // announced total (blocks with no symbol at all).
                     receiver.set_total_blocks(total);
+                }
+                Some(blocks) = hw_rx.recv() => {
+                    // Running high-water mark: bounds the entirely-lost scan so a
+                    // block whose every datagram was lost is still recovered even
+                    // if no later block ever advances the observed high mark.
+                    receiver.set_high_water(blocks);
                 }
                 // Reliable-retransmit data: inject verbatim, bypassing FEC. This
                 // is the convergence lower bound — a block that FEC could not

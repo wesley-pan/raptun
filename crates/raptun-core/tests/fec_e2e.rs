@@ -165,15 +165,18 @@ async fn connect_with_retry(addr: SocketAddr) -> TcpStream {
 async fn fec_pump_direct_smoke() {
     // Sanity: the pump types recover a payload with zero loss, no sockets.
     use raptun_core::fec::{FecReceiver, FecSender};
+    use raptun_fec::RepairBudget;
     use raptun_proto::datagram::SymbolHeader;
     use std::time::Instant;
     let mut s = FecSender::new(1, 1100, 8);
     let dgs = s.encode_blocks(b"direct smoke test payload", 2);
     let mut r = FecReceiver::new(1100, 8);
+    let budget = RepairBudget::new(1100, 0.4);
+    budget.refresh_ceiling(10_000_000);
     let mut out = Vec::new();
     for dg in &dgs {
         let (h, p) = SymbolHeader::parse(dg).unwrap();
-        out.extend_from_slice(&r.on_symbol(h.block_id, h.esi, p, Instant::now()));
+        out.extend_from_slice(&r.on_symbol(h.block_id, h.esi, p, Instant::now(), &budget));
     }
     assert_eq!(out, b"direct smoke test payload");
 }
