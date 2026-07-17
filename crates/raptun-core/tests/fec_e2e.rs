@@ -161,6 +161,137 @@ async fn connect_with_retry(addr: SocketAddr) -> TcpStream {
     panic!("could not connect to client local port {addr}");
 }
 
+/// Drive one uppercase round-trip through the client's local port. Returns the
+/// echoed bytes (may be short on failure so callers can assert).
+async fn roundtrip_once(local_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut conn = connect_with_retry(local_addr).await;
+    conn.write_all(payload).await.unwrap();
+    // Signal EOF so the echo target's read loop and the tunnel can complete.
+    let _ = conn.shutdown().await;
+
+    let mut got = Vec::new();
+    let mut buf = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while got.len() < payload.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, conn.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    got
+}
+
+/// The client must re-establish its QUIC connection after the server restarts,
+/// rather than wedging on the dead connection forever ("open signaling bi:
+/// timed out"). We run the reliable-stream path (FEC off) so the test exercises
+/// only the reconnect supervision, kill the server, respawn it on the same UDP
+/// address, and prove a fresh round-trip succeeds.
+#[tokio::test]
+async fn client_reconnects_after_server_restart() {
+    // The two server instances must present the same leaf certificate so the
+    // client's pinned fingerprint keeps matching across the restart.
+    fn clone_identity(id: &ServerIdentity) -> ServerIdentity {
+        ServerIdentity {
+            cert_chain: id.cert_chain.clone(),
+            private_key: id.private_key.clone_key(),
+            fingerprint_hex: id.fingerprint_hex.clone(),
+        }
+    }
+
+    let _guard = E2E_LOCK.lock().await;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("raptun_core=debug")
+        .with_test_writer()
+        .try_init();
+    let echo_addr = spawn_echo().await;
+
+    // Reliable-stream config (FEC off) keeps the test focused on reconnect.
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+    let mut cfg = fec_config();
+    cfg.fec.scheme = FecScheme::Off;
+    cfg.transport.use_datagrams = false;
+    // A short idle timeout lets the client notice the dead server quickly.
+    cfg.transport.idle_timeout = Duration::from_secs(3);
+    cfg.transport.keepalive = Some(Duration::from_secs(1));
+
+    // Reserve a server UDP port, then free it so run_server can bind it.
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_addr = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+            .unwrap();
+        ep.local_addr().unwrap()
+    };
+
+    // First server instance.
+    let srv_cfg = cfg.clone();
+    let srv_id = clone_identity(&identity);
+    let server1 = tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Client with a stable local port.
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let local_addr = {
+        let l = TcpListener::bind(local_bind).await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Round-trip #1 against the first server.
+    let payload = b"first server round trip";
+    let got = roundtrip_once(local_addr, payload).await;
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(got, expected, "first round-trip must succeed");
+
+    // Kill the server and wait for its endpoint to release the UDP port.
+    server1.abort();
+    let _ = server1.await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart the server on the same address.
+    let srv_cfg = cfg.clone();
+    let srv_id = clone_identity(&identity);
+    let server2 = tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id).await;
+    });
+
+    // Give the client time to notice the drop (idle timeout) and reconnect with
+    // backoff to the restarted server.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Round-trip #2 must succeed over the reconnected tunnel.
+    let payload = b"second server round trip after restart";
+    let got = roundtrip_once(local_addr, payload).await;
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(
+        got, expected,
+        "client must reconnect after server restart and round-trip again"
+    );
+
+    server2.abort();
+}
+
 #[tokio::test]
 async fn fec_pump_direct_smoke() {
     // Sanity: the pump types recover a payload with zero loss, no sockets.
