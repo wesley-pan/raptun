@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,6 +35,11 @@ pub enum ListenMode {
 
 /// Run the client: listen locally, and for each accepted TCP connection open a
 /// QUIC bi-stream to the server and pump bytes both ways.
+///
+/// The QUIC connection is supervised: if it drops (e.g. the server restarts),
+/// the client re-dials with capped exponential backoff and resumes serving,
+/// rather than wedging on a dead connection. The local listener is bound once
+/// and shared across reconnects so the local port stays stable.
 pub async fn run_client(
     config: RuntimeConfig,
     local_addr: SocketAddr,
@@ -52,26 +57,73 @@ pub async fn run_client(
     let transport = build_transport(&config.transport)?;
     let endpoint = build_client_endpoint(&trust, transport)?;
 
-    tracing::info!(%server_addr, %sni, "connecting to raptun server");
+    // Bind the local listener once so the local port is stable across QUIC
+    // reconnects. Accepted connections are held until a live server connection
+    // exists to serve them.
+    let listener = TcpListener::bind(local_addr).await?;
+    tracing::info!(%local_addr, "listening for local connections");
+
+    let config = Arc::new(config);
+
+    // Supervision loop: (re)establish the QUIC connection and serve tunnels over
+    // it until it drops, then reconnect with capped exponential backoff.
+    let mut backoff = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    loop {
+        tracing::info!(%server_addr, %sni, "connecting to raptun server");
+        let conn = match connect_and_handshake(&endpoint, server_addr, sni, &config).await {
+            Ok(conn) => {
+                backoff = Duration::from_millis(500); // reset after a good connection
+                conn
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, retry_in = ?backoff, "connect/handshake failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+
+        // Serve tunnels over this connection until it closes. On return the
+        // connection is dead (server gone, idle timeout, etc.) and we reconnect.
+        serve_connection(conn, &listener, &config).await?;
+        tracing::warn!(%server_addr, "server connection lost; reconnecting");
+    }
+}
+
+/// Establish one QUIC connection to the server and run the handshake.
+async fn connect_and_handshake(
+    endpoint: &quinn::Endpoint,
+    server_addr: SocketAddr,
+    sni: &str,
+    config: &RuntimeConfig,
+) -> Result<(Arc<quinn::Connection>, FecParams)> {
     let conn = endpoint
         .connect(server_addr, sni)
         .map_err(|e| CoreError::Endpoint(format!("connect: {e}")))?
         .await
         .map_err(|e| CoreError::Endpoint(format!("connection: {e}")))?;
 
-    let (_ctrl, fec) = handshake_client(&conn, &config).await?;
+    let (_ctrl, fec) = handshake_client(&conn, config).await?;
     tracing::info!(
         symbol_size = fec.symbol_size,
         repair_ppm = fec.repair_ppm,
         "handshake ok"
     );
+    Ok((Arc::new(conn), fec))
+}
 
-    let listener = TcpListener::bind(local_addr).await?;
-    tracing::info!(%local_addr, "listening for local connections");
+/// Accept local TCP connections and tunnel each over the given QUIC connection,
+/// returning once the QUIC connection is no longer usable so the caller can
+/// reconnect. The local listener persists across calls.
+async fn serve_connection(
+    conn_fec: (Arc<quinn::Connection>, FecParams),
+    listener: &TcpListener,
+    config: &Arc<RuntimeConfig>,
+) -> Result<()> {
+    let (conn, fec) = conn_fec;
 
-    let use_fec = config.transport.use_datagrams && fec_enabled(&config);
-    let conn = Arc::new(conn);
-    let config = Arc::new(config);
+    let use_fec = config.transport.use_datagrams && fec_enabled(config);
 
     // Connection-wide datagram reader for the FEC path.
     let hub = DatagramHub::new();
@@ -83,12 +135,21 @@ pub async fn run_client(
     }
 
     loop {
-        let (tcp, peer) = listener.accept().await?;
+        // Race accepting a local connection against the QUIC connection closing,
+        // so a server that goes away while we are idle triggers a reconnect
+        // instead of leaving us blocked in `accept()`.
+        let (tcp, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            closed = conn.closed() => {
+                tracing::debug!(reason = %closed, "quic connection closed while idle");
+                return Ok(());
+            }
+        };
         tracing::debug!(%peer, "accepted local connection");
         let conn = Arc::clone(&conn);
         let hub = hub.clone();
         let fec = fec.clone();
-        let config = Arc::clone(&config);
+        let config = Arc::clone(config);
         tokio::spawn(async move {
             let res = if use_fec {
                 handle_client_conn_fec(&conn, &hub, &fec, &config, tcp).await
