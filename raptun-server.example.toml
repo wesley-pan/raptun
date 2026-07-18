@@ -1,0 +1,46 @@
+# Example Raptun server configuration.
+#
+# Precedence when a value is set in multiple places:
+#   CLI flag  >  environment variable  >  this file  >  built-in default
+#
+# Pass with:  raptun-server -c raptun-server.example.toml
+
+listen = "0.0.0.0:29900"
+target = "127.0.0.1:8080"                  # forward tunnelled TCP here (plain-TCP mode)
+
+# Application-level auth (NOT encryption; QUIC/TLS already encrypts).
+# The "env:" prefix pulls the value from the named environment variable so the
+# secret is not stored in plaintext.
+psk         = "env:RAPTUN_PSK"
+client_auth = "psk"                        # none | psk | mtls
+
+# TLS identity. Either point at a PEM cert+key (production), or set
+# self_signed = true to generate one at startup and print its fingerprint for
+# clients to pin (testing). cert/key and self_signed are mutually exclusive.
+cert        = "/etc/raptun/server.pem"
+key         = "/etc/raptun/server-key.pem"
+# self_signed = true
+
+max_conns   = 4096                         # max concurrent client connections
+# metrics   = "127.0.0.1:9100"             # Prometheus endpoint
+# pprof     = "127.0.0.1:6060"             # profiling endpoint
+log_level   = "info"                       # error|warn|info|debug|trace
+
+[fec]
+scheme      = "raptorq"                    # off | raptorq | xor
+max         = 0.50                         # ceiling on repair overhead a client may request
+symbol_size = 1200                         # MUST match the client
+
+[transport]
+cc            = "bbr"                       # bbr | cubic | newreno
+mtu           = 1350                        # MUST match the client
+datagram      = true                        # false => reliable streams, FEC off
+stream_rwnd   = 2097152                     # 2 MiB
+conn_rwnd     = 16777216                    # 16 MiB
+max_streams   = 1024                        # concurrent tunnels per connection (each holds one bidi stream)
+sockbuf       = 4194304                     # 4 MiB UDP socket buffer
+keepalive     = 10                          # seconds; 0 disables
+idle_timeout  = 30
+migration     = true
+zero_rtt      = true
+dscp          = 0

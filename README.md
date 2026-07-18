@@ -34,8 +34,8 @@ backend). Per-OS setup (macOS / Linux / Windows / musl / cross) is in
 
 ```bash
 cargo build --release            # optimized binaries → target/release/
-cargo test                       # 44 tests across proto/fec/core (+real-QUIC e2e + netem)
-cargo test --features test-hooks # 46 tests: adds the lossy-link recovery + degrade e2e
+cargo test                       # 62 tests across proto/fec/core/cli (+real-QUIC e2e + netem)
+cargo test --features test-hooks # 65 tests: adds the lossy-link recovery + degrade e2e
 cargo clippy --all-targets       # lints
 ```
 
@@ -55,7 +55,7 @@ support matrix in [`docs/BUILD.md`](docs/BUILD.md).
   route-registration race), reassembled in order, and forwarded. FEC is on by
   default; `--fec off` or `--datagram false` falls back to the reliable path.
   Proven by:
-  - `cargo test` — **44 tests** (46 with `--features test-hooks`), including
+  - `cargo test` — **62 tests** (65 with `--features test-hooks`), including
     real-QUIC loopback tests and an
     end-to-end FEC tunnel test (`tests/fec_e2e.rs`) that drives the full
     `run_client`/`run_server` loops socket-to-socket over the datagram path.
@@ -116,3 +116,71 @@ raptun-server -l 0.0.0.0:29900 -r 127.0.0.1:8080 --self-signed --psk "$SECRET"
 raptun-client -l 127.0.0.1:12948 -r vps.example.com:29900 \
     --psk "$SECRET" --fingerprint SHA256:aabbcc...
 ```
+
+## Configuration
+
+Every setting can be given three ways, in decreasing precedence:
+
+```
+CLI flag  >  environment variable  >  config file (-c)  >  built-in default
+```
+
+So a `--config` file supplies your baseline and any CLI flag overrides it for a
+one-off. `raptun-{client,server} --help` lists every flag; the two annotated
+example files — [`raptun-client.example.toml`](raptun-client.example.toml) and
+[`raptun-server.example.toml`](raptun-server.example.toml) — document the same
+settings in file form. Secrets can be kept out of the file with the `env:`
+prefix (`psk = "env:RAPTUN_PSK"` reads `$RAPTUN_PSK`).
+
+**Config-file form** (production: real cert, secret from the environment):
+
+```bash
+export RAPTUN_PSK="…"
+
+# server.toml: listen, target, cert/key, client_auth, [fec], [transport] …
+raptun-server -c server.toml
+
+# client.toml: remoteaddr, fingerprint or cert, [fec], [transport] …
+raptun-client -c client.toml
+```
+
+**Full CLI form** (equivalent, everything explicit):
+
+```bash
+# ---- Server ----
+RAPTUN_PSK="…" raptun-server \
+    -l 0.0.0.0:29900 -r 127.0.0.1:8080 \
+    --cert /etc/raptun/server.pem --key /etc/raptun/server-key.pem \
+    --client-auth psk \
+    --fec raptorq --fec-max 0.5 --symbol-size 1200 --mtu 1350 --cc bbr \
+    --max-streams 1024 --max-conns 4096 \
+    --keepalive 10 --idle-timeout 30 --log-level info
+
+# ---- Client ----
+RAPTUN_PSK="…" raptun-client \
+    -l 127.0.0.1:12948 -r vps.example.com:29900 \
+    --listen-mode tcp --sni <cert-CN/SAN> \
+    --fec raptorq --fec-mode adaptive --fec-min 0.02 --fec-max 0.5 \
+    --symbol-size 1200 --mtu 1350 --cc bbr \
+    --max-streams 1024 --keepalive 10 --heartbeat 30 --idle-timeout 30 \
+    --log-level info
+```
+
+**Loopback test** (self-signed, pin the fingerprint the server prints):
+
+```bash
+raptun-server -l 127.0.0.1:29900 -r 127.0.0.1:8080 --self-signed --psk secret
+# copy the "SHA256:…" fingerprint from the server log, then:
+raptun-client -l 127.0.0.1:12948 -r 127.0.0.1:29900 \
+    --psk secret --fingerprint SHA256:… --heartbeat 2
+```
+
+Settings that **must match on both ends**: `--psk`, `--symbol-size`, `--mtu`,
+and the FEC scheme. `--symbol-size` mismatch makes RaptorQ decoding fail
+outright. The server's `--fec-max` is a hard ceiling that clamps whatever repair
+ratio a client requests.
+
+> **Trust:** `--fingerprint` (trust-on-first-use pinning) and `--insecure`
+> (testing only) are wired today; client-side `--cert`/CA-file trust is a
+> Phase-4 item.
+

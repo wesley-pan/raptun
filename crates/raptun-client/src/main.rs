@@ -7,14 +7,16 @@ mod cli;
 
 use std::net::ToSocketAddrs;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::{Cli, ListenMode as CliListenMode};
 use raptun_core::run::ListenMode;
 use raptun_core::tls::ServerTrust;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut args = Cli::from_arg_matches(&matches)?;
+    args.merge_file(&matches)?;
     init_tracing(&args.log_level, args.quiet);
 
     let config = args.to_runtime_config();
@@ -25,11 +27,13 @@ async fn main() -> anyhow::Result<()> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not resolve --localaddr {}", args.localaddr))?;
-    let server_addr = args
-        .remoteaddr
+    let remoteaddr = args.remoteaddr.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--remoteaddr is required (pass -r or set it in --config)")
+    })?;
+    let server_addr = remoteaddr
         .to_socket_addrs()?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve --remoteaddr {}", args.remoteaddr))?;
+        .ok_or_else(|| anyhow::anyhow!("could not resolve --remoteaddr {remoteaddr}"))?;
 
     // Decide how to trust the server certificate.
     let trust = if args.insecure {
