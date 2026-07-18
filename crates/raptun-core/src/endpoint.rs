@@ -19,6 +19,15 @@ use crate::{CoreError, Result};
 /// burst of symbols; a few MiB is plenty for the FEC path.
 const DATAGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Datagram *send*-buffer size. Quinn's default is only 1 MiB, and its
+/// `send_datagram` silently evicts the oldest queued symbol once that fills —
+/// so a large burst strands early blocks and stalls the tunnel (see
+/// `live_size_sweep.sh`). The sender back-pressures on a full buffer rather
+/// than evicting (`send_datagram_paced` in `run.rs`), but a generous buffer,
+/// symmetric with the receive side, keeps normal bursts flowing without
+/// repeatedly parking the send loop.
+const DATAGRAM_SEND_BUFFER: usize = 8 * 1024 * 1024;
+
 /// Translate [`TransportConfig`] into a shared `quinn::TransportConfig`.
 ///
 /// The same transport parameters are used on both client and server so their
@@ -65,6 +74,7 @@ pub fn build_transport(cfg: &TransportConfig) -> Result<Arc<QuinnTransport>> {
     // FEC path is bypassed and business data rides reliable streams instead.
     if cfg.use_datagrams {
         t.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+        t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     } else {
         t.datagram_receive_buffer_size(None);
     }

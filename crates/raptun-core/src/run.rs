@@ -660,7 +660,7 @@ async fn run_fec_tunnel(
                     // traffic whose messages are far smaller than a block.
                     for chunk in buf[..n].chunks(cap) {
                         for dg in sender.encode_one_block(chunk, repair) {
-                            send_datagram_lossy(&up_conn, dg);
+                            send_datagram_paced(&up_conn, dg).await;
                         }
                         total_blocks += 1;
                     }
@@ -676,7 +676,7 @@ async fn run_fec_tunnel(
                 // Serve an inbound NACK: mint fresh repair for the named block.
                 Some((block, need)) = nack_rx.recv() => {
                     for dg in sender.additional_repair(block, need) {
-                        send_datagram_lossy(&up_conn, dg);
+                        send_datagram_paced(&up_conn, dg).await;
                     }
                 }
                 // Serve a reliable-retransmit request: ship the block's bytes
@@ -699,7 +699,7 @@ async fn run_fec_tunnel(
             tokio::select! {
                 Some((block, need)) = nack_rx.recv() => {
                     for dg in sender.additional_repair(block, need) {
-                        send_datagram_lossy(&up_conn, dg);
+                        send_datagram_paced(&up_conn, dg).await;
                     }
                 }
                 Some(block) = rel_req_rx.recv() => {
@@ -824,22 +824,36 @@ pub fn set_test_drop_one_in(n: u64) {
     TEST_DROP_COUNTER.store(0, Ordering::Relaxed);
 }
 
-/// Send a datagram, tolerating "too large" / transient errors by dropping the
-/// symbol — FEC on the stream absorbs individual symbol loss, so a dropped
-/// datagram is not fatal.
-fn send_datagram_lossy(conn: &quinn::Connection, dg: bytes::Bytes) {
+/// Hand a datagram to the transport, applying back-pressure instead of losing
+/// it to a full local send buffer.
+///
+/// `quinn::Connection::send_datagram` uses `drop = true` internally: when the
+/// outgoing datagram buffer is full it *silently evicts the oldest queued,
+/// still-unsent* symbol and returns `Ok`. During a large burst that evicts the
+/// head of the queue — the very symbols an early block still needs — so those
+/// blocks strand, degrade to reliable retransmit, and the un-paced sender
+/// self-inflicts loss on an otherwise clean link (see
+/// `live_size_sweep.sh`: a hard delivery cliff at the 1 MiB default buffer).
+///
+/// `send_datagram_wait` instead awaits `datagrams_unblocked` when the buffer is
+/// full, so this becomes real back-pressure: the caller's TCP read loop pauses
+/// until the transport drains, and no locally-queued symbol is ever dropped.
+/// Genuine on-wire loss (the case FEC exists to absorb) still happens in the
+/// network, where repair symbols recover it. `TooLarge`/`UnsupportedByPeer` and
+/// a lost connection are non-retryable and are simply logged and dropped.
+async fn send_datagram_paced(conn: &quinn::Connection, dg: bytes::Bytes) {
     #[cfg(feature = "test-hooks")]
     {
         let n = TEST_DROP_ONE_IN.load(Ordering::Relaxed);
         if n > 0 {
             let c = TEST_DROP_COUNTER.fetch_add(1, Ordering::Relaxed);
             if c % n == 0 {
-                // Simulate loss: never hand this symbol to the transport.
+                // Simulate on-wire loss: never hand this symbol to the transport.
                 return;
             }
         }
     }
-    if let Err(e) = conn.send_datagram(dg) {
+    if let Err(e) = conn.send_datagram_wait(dg).await {
         tracing::trace!(error = %e, "datagram dropped (FEC will absorb)");
     }
 }
