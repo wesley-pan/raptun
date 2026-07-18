@@ -134,6 +134,13 @@ async fn serve_connection(
         tracing::info!("data path: reliable QUIC streams (FEC off)");
     }
 
+    // Count of currently-live tunnels, surfaced by the heartbeat. Each accepted
+    // connection increments it and a guard decrements on completion.
+    let active = Arc::new(AtomicU64::new(0));
+    if let Some(interval) = config.transport.heartbeat {
+        spawn_client_heartbeat(Arc::clone(&conn), Arc::clone(&active), interval);
+    }
+
     loop {
         // Race accepting a local connection against the QUIC connection closing,
         // so a server that goes away while we are idle triggers a reconnect
@@ -150,7 +157,12 @@ async fn serve_connection(
         let hub = hub.clone();
         let fec = fec.clone();
         let config = Arc::clone(config);
+        let active = Arc::clone(&active);
         tokio::spawn(async move {
+            // Track this tunnel in the live count for the heartbeat; the guard
+            // decrements even if the tunnel returns early with an error.
+            active.fetch_add(1, Ordering::Relaxed);
+            let _guard = ActiveGuard(&active);
             let res = if use_fec {
                 handle_client_conn_fec(&conn, &hub, &fec, &config, tcp).await
             } else {
@@ -161,6 +173,50 @@ async fn serve_connection(
             }
         });
     }
+}
+
+/// Decrements the active-tunnel counter when a tunnel task ends, on any path.
+struct ActiveGuard<'a>(&'a AtomicU64);
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Spawn the periodic client heartbeat: at `interval`, log one `info` line with
+/// live connection telemetry (RTT / cwnd / loss / active tunnels) so a healthy,
+/// otherwise-silent tunnel still produces rolling output confirming liveness.
+/// The task ends when the connection closes.
+fn spawn_client_heartbeat(
+    conn: Arc<quinn::Connection>,
+    active: Arc<AtomicU64>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick so the heartbeat doesn't fire at t=0
+        // right after the startup logs.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let sample = crate::session::read_telemetry(&conn);
+                    tracing::info!(
+                        rtt_ms = sample.smoothed_rtt.as_millis(),
+                        cwnd_bytes = sample.cwnd_bytes,
+                        loss_pct = format!("{:.2}", sample.loss_rate * 100.0),
+                        active_tunnels = active.load(Ordering::Relaxed),
+                        "tunnel alive"
+                    );
+                }
+                closed = conn.closed() => {
+                    tracing::debug!(reason = %closed, "heartbeat stopping (connection closed)");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Open a QUIC bi-stream for one local TCP connection and tunnel it (reliable).
