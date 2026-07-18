@@ -34,8 +34,8 @@ backend). Per-OS setup (macOS / Linux / Windows / musl / cross) is in
 
 ```bash
 cargo build --release            # optimized binaries → target/release/
-cargo test                       # 62 tests across proto/fec/core/cli (+real-QUIC e2e + netem)
-cargo test --features test-hooks # 65 tests: adds the lossy-link recovery + degrade e2e
+cargo test                       # 63 tests across proto/fec/core/cli (+real-QUIC e2e + netem)
+cargo test --features test-hooks # 66 tests: adds the lossy-link recovery + degrade e2e
 cargo clippy --all-targets       # lints
 ```
 
@@ -55,7 +55,7 @@ support matrix in [`docs/BUILD.md`](docs/BUILD.md).
   route-registration race), reassembled in order, and forwarded. FEC is on by
   default; `--fec off` or `--datagram false` falls back to the reliable path.
   Proven by:
-  - `cargo test` — **62 tests** (65 with `--features test-hooks`), including
+  - `cargo test` — **63 tests** (66 with `--features test-hooks`), including
     real-QUIC loopback tests and an
     end-to-end FEC tunnel test (`tests/fec_e2e.rs`) that drives the full
     `run_client`/`run_server` loops socket-to-socket over the datagram path.
@@ -154,7 +154,7 @@ RAPTUN_PSK="…" raptun-server \
     --client-auth psk \
     --fec raptorq --fec-max 0.5 --symbol-size 1200 --mtu 1350 --cc bbr \
     --max-streams 1024 --max-conns 4096 \
-    --keepalive 10 --idle-timeout 30 --log-level info
+    --keepalive 10 --idle-timeout 30 --connect-timeout 10 --log-level info
 
 # ---- Client ----
 RAPTUN_PSK="…" raptun-client \

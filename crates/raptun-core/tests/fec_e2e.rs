@@ -1052,3 +1052,76 @@ async fn large_payload_survives_send_buffer_pressure() {
     );
     assert_eq!(got, expected, "large payload must round-trip intact");
 }
+
+/// When the server cannot reach its forwarding target, it must reset the
+/// tunnel's stream so the client's local TCP connection closes promptly — not
+/// hang until the idle timeout. Regression guard for the un-bounded target
+/// connect: previously each tunnel parked on the OS connect timeout (~130 s)
+/// with its QUIC stream open, so `active_tunnels` piled up and the client saw
+/// no error.
+#[tokio::test]
+async fn unreachable_target_closes_client_connection() {
+    let _guard = E2E_LOCK.lock().await;
+
+    // A target nobody is listening on: connect fails fast with "refused", which
+    // drives the same reset path as a timeout without waiting on the clock.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_target = dead_listener.local_addr().unwrap();
+    drop(dead_listener); // free the port so connects are refused
+
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+
+    // Short connect timeout keeps the test snappy even if the OS coalesces the
+    // refusal into a brief wait; the assertion below allows well under the
+    // 30 s idle timeout regardless.
+    let mut cfg = fec_config();
+    cfg.transport.target_connect_timeout = Duration::from_secs(2);
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_ep = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+    };
+    let server_addr = server_ep.local_addr().unwrap();
+    drop(server_ep);
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, dead_target, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client_listener = TcpListener::bind(local_bind).await.unwrap();
+    let local_addr = client_listener.local_addr().unwrap();
+    drop(client_listener);
+
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut conn = connect_with_retry(local_addr).await;
+    conn.write_all(b"ping").await.unwrap();
+
+    // The read must return EOF (0 bytes) well before the 30 s idle timeout.
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_secs(15), conn.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) => {} // clean EOF — the server reset propagated
+        Ok(Ok(n)) => panic!("expected EOF, got {n} bytes from an unreachable target"),
+        Ok(Err(_)) => {} // a connection error is also an acceptable prompt close
+        Err(_) => panic!("client connection hung: server did not reset on unreachable target"),
+    }
+}

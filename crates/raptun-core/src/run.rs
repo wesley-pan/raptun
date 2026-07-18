@@ -299,6 +299,12 @@ pub async fn run_server(
     Ok(())
 }
 
+/// QUIC application error code used to reset a tunnel's stream when the server
+/// cannot reach its forwarding target (connect error or timeout). Distinct
+/// non-zero code so a packet capture / peer can tell it apart from a clean
+/// close (0).
+const TARGET_UNREACHABLE_CODE: quinn::VarInt = quinn::VarInt::from_u32(1);
+
 /// Handle one accepted QUIC connection: handshake, then forward each inbound
 /// bi-stream to the target service.
 async fn handle_server_conn(
@@ -316,6 +322,7 @@ async fn handle_server_conn(
     tracing::debug!(%remote, "handshake ok");
 
     let use_fec = config.transport.use_datagrams && fec_enabled(&config);
+    let connect_timeout = config.transport.target_connect_timeout;
     let conn = Arc::new(conn);
     let config = Arc::new(config);
 
@@ -332,7 +339,7 @@ async fn handle_server_conn(
     let budget = new_conn_budget(&conn, &fec, &config);
 
     loop {
-        let (send, recv) = match conn.accept_bi().await {
+        let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::debug!(%remote, error = %e, "connection ended");
@@ -344,8 +351,11 @@ async fn handle_server_conn(
         let fec = fec.clone();
         let budget = Arc::clone(&budget);
         tokio::spawn(async move {
-            match TcpStream::connect(target).await {
-                Ok(tcp) => {
+            // Bound the target connect: an unreachable target must not park this
+            // tunnel on the OS default timeout while its QUIC stream stays open.
+            let connect = tokio::time::timeout(connect_timeout, TcpStream::connect(target)).await;
+            match connect {
+                Ok(Ok(tcp)) => {
                     let res = if use_fec {
                         server_tunnel_fec(&conn, &hub, &fec, &budget, tcp, send, recv).await
                     } else {
@@ -359,7 +369,22 @@ async fn handle_server_conn(
                         }
                     }
                 }
-                Err(e) => tracing::warn!(%target, error = %e, "failed to reach target"),
+                // Could not reach the target — reset the tunnel's stream so the
+                // client side unwinds now instead of hanging until idle timeout.
+                Ok(Err(e)) => {
+                    tracing::warn!(%target, error = %e, "failed to reach target");
+                    let _ = send.reset(TARGET_UNREACHABLE_CODE);
+                    let _ = recv.stop(TARGET_UNREACHABLE_CODE);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %target,
+                        timeout_ms = connect_timeout.as_millis() as u64,
+                        "target connect timed out"
+                    );
+                    let _ = send.reset(TARGET_UNREACHABLE_CODE);
+                    let _ = recv.stop(TARGET_UNREACHABLE_CODE);
+                }
             }
         });
     }
@@ -600,14 +625,20 @@ async fn run_fec_tunnel(
     };
 
     // --- Signal reader: owns sig_recv, demultiplexes inbound signals. ---
+    // Returns `true` if the stream ended abnormally (peer reset / read error),
+    // as opposed to a clean finish (`Ok(None)`). The caller uses this to tell a
+    // control-channel failure — e.g. the server resetting the stream because it
+    // could not reach its target — apart from the normal end-of-stream that
+    // follows a completed transfer.
     let reader = async move {
         let mut sig_recv = sig_recv;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 512];
-        loop {
+        let reset = loop {
             match sig_recv.read(&mut chunk).await {
                 Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                Ok(None) | Err(_) => break, // signaling stream finished
+                Ok(None) => break false, // peer finished the stream cleanly
+                Err(_) => break true,    // peer reset / read error
             }
             // Drain as many complete signals as the buffer holds.
             while let Some((sig, used)) = TunnelSignal::decode(&buf) {
@@ -630,8 +661,8 @@ async fn run_fec_tunnel(
                     }
                 }
             }
-        }
-        Ok::<(), CoreError>(())
+        };
+        reset
     };
 
     // --- Upstream: TCP -> FEC datagrams, plus serving inbound NACKs and
@@ -802,10 +833,33 @@ async fn run_fec_tunnel(
     // finish and release their clones.
     drop(sig_tx);
 
-    let (up_r, down_r, _w, _r) = tokio::join!(up, down, writer, reader);
-    up_r?;
-    down_r?;
-    Ok(())
+    // The signaling stream is the tunnel's control lifeline. If the peer
+    // *resets* it before the data directions wind down on their own — e.g. the
+    // server could not reach its target and reset the stream — the tunnel can
+    // make no further progress, so tear it down now (dropping `up`/`down`
+    // closes the local TCP) instead of hanging until the idle timeout. A clean
+    // finish (`reader` returns `false`) is the *normal* end-of-transfer signal
+    // and must NOT interrupt the data directions, which may still be flushing
+    // the final bytes — in that case we fall through to awaiting them.
+    let data = async {
+        let (up_r, down_r, _w) = tokio::join!(up, down, writer);
+        up_r?;
+        down_r?;
+        Ok::<(), CoreError>(())
+    };
+    tokio::pin!(data);
+    tokio::select! {
+        r = &mut data => r,
+        reset = reader => {
+            if reset {
+                // Control channel failed abnormally — abandon the tunnel.
+                Ok(())
+            } else {
+                // Clean finish; let the data directions complete normally.
+                (&mut data).await
+            }
+        }
+    }
 }
 
 /// Test-only datagram loss injection: drop 1-in-N sent datagrams to exercise

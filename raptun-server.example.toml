@@ -41,6 +41,7 @@ max_streams   = 1024                        # concurrent tunnels per connection 
 sockbuf       = 4194304                     # 4 MiB UDP socket buffer
 keepalive     = 10                          # seconds; 0 disables
 idle_timeout  = 30
+connect_timeout = 10                        # seconds to reach the forwarding target before resetting the tunnel
 migration     = true
 zero_rtt      = true
 dscp          = 0
