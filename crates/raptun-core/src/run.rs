@@ -494,9 +494,15 @@ async fn run_fec_tunnel(
     // an EOF to the peer's `reader` so the peer's identical loop also
     // unwinds. Without this, both ends deadlock waiting on each other and
     // `ActiveGuard` is never dropped (the `active_tunnels` leak).
-    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let up_shutdown = shutdown.clone();
-    let down_shutdown = shutdown.clone();
+    //
+    // A `oneshot` (not `Notify`) is essential here: the two directions finish
+    // in arbitrary order, and `down` can complete *before* `up` reaches its
+    // post-EOF loop and first awaits the signal (e.g. the peer half-closes its
+    // write side while the local socket stays open). `Notify::notify_waiters()`
+    // only wakes waiters already parked at that instant, so such an early
+    // completion would be lost forever and `up` would hang — reintroducing the
+    // leak. `oneshot` buffers the send: `up` observes it regardless of ordering.
+    let (down_done_tx, down_done_rx) = tokio::sync::oneshot::channel::<()>();
 
     // --- Signal writer: owns sig_send, serializes queued signals. ---
     let writer = async move {
@@ -551,6 +557,7 @@ async fn run_fec_tunnel(
     let up_conn = conn.clone();
     let up_sig = sig_tx.clone();
     let up = async move {
+        let mut down_done_rx = down_done_rx;
         let mut sender = FecSender::new(stream_id, symbol_size, k);
         let cap = sender.block_payload();
         let mut buf = vec![0u8; cap];
@@ -621,7 +628,9 @@ async fn run_fec_tunnel(
                 // Downstream finished: stop serving late repairs and unwind so
                 // the sig_tx clones drop, writer.finish() cascades EOF to the
                 // peer, and `ActiveGuard` can drop (fixes active_tunnels leak).
-                _ = up_shutdown.notified() => break,
+                // `&mut` so a not-yet-fired receiver can be re-polled next
+                // iteration; a fired/closed receiver resolves immediately.
+                _ = &mut down_done_rx => break,
                 else => break,
             }
         }
@@ -697,7 +706,12 @@ async fn run_fec_tunnel(
             }
         }
         let _ = tcp_write.shutdown().await;
-        down_shutdown.notify_waiters();
+        // Signal `up` that the receive direction is done. Buffered by the
+        // oneshot, so it unblocks `up` even if `up` has not yet reached its
+        // post-EOF await. (Any early `?` return above instead *drops*
+        // `down_done_tx`, which closes the channel and likewise wakes `up` —
+        // either way `up` never hangs.)
+        let _ = down_done_tx.send(());
         Ok::<(), CoreError>(())
     };
 
