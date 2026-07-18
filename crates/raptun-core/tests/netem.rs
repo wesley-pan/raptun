@@ -237,6 +237,7 @@ fn run_scenario(
                 item.esi,
                 &item.payload,
                 clock_start + Duration::from_millis(now),
+                &budget,
             );
             record_delivered(
                 &mut block_done,
@@ -255,6 +256,9 @@ fn run_scenario(
                         if total != u64::MAX {
                             receiver.set_total_blocks(total);
                         }
+                    }
+                    TunnelSignal::HighWater { blocks } => {
+                        receiver.set_high_water(blocks);
                     }
                     TunnelSignal::Nack { block, need, .. } => {
                         // Sender serves the NACK with fresh repair on the data channel.

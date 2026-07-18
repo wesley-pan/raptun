@@ -48,6 +48,13 @@ pub enum TunnelSignal {
     /// once, when the upstream reaches EOF, so the receiver knows when it has
     /// delivered everything despite datagram loss.
     BlockCount { total: u64 },
+    /// Sender → receiver: the sender has emitted `blocks` blocks so far (a
+    /// running high-water mark, *not* a terminal count). Sent on the reliable
+    /// stream after a send burst so the receiver learns that a block exists even
+    /// when every one of its datagrams was lost and no later block follows — the
+    /// interactive request/response case where the stream would otherwise strand
+    /// forever with no progress signal to trip the loss detector.
+    HighWater { blocks: u64 },
     /// Receiver → sender: block `block` is stalled; the receiver has `have`
     /// symbols and still needs `need` more. The sender responds by minting
     /// `need` fresh repair symbols (idempotent: repeated NACKs request fewer).
@@ -71,6 +78,7 @@ impl TunnelSignal {
     const TAG_NACK: u8 = 2;
     const TAG_RELIABLE_REQUEST: u8 = 3;
     const TAG_RELIABLE_DATA: u8 = 4;
+    const TAG_HIGH_WATER: u8 = 5;
 
     /// Upper bound on a `ReliableData` payload we will accept, to cap the
     /// allocation a peer can force. One block is at most `K * symbol_size`;
@@ -84,6 +92,10 @@ impl TunnelSignal {
             TunnelSignal::BlockCount { total } => {
                 b.push(Self::TAG_BLOCK_COUNT);
                 b.extend_from_slice(&total.to_be_bytes());
+            }
+            TunnelSignal::HighWater { blocks } => {
+                b.push(Self::TAG_HIGH_WATER);
+                b.extend_from_slice(&blocks.to_be_bytes());
             }
             TunnelSignal::Nack { block, have, need } => {
                 b.push(Self::TAG_NACK);
@@ -116,6 +128,13 @@ impl TunnelSignal {
                 }
                 let total = u64::from_be_bytes(buf[1..9].try_into().unwrap());
                 Some((TunnelSignal::BlockCount { total }, 9))
+            }
+            Self::TAG_HIGH_WATER => {
+                if buf.len() < 1 + 8 {
+                    return None;
+                }
+                let blocks = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Some((TunnelSignal::HighWater { blocks }, 9))
             }
             Self::TAG_NACK => {
                 if buf.len() < 1 + 8 + 4 + 4 {
@@ -267,7 +286,18 @@ pub struct FecSender {
     /// Retained original payload bytes per block, so a stranded block can be
     /// shipped reliably as the convergence lower-bound fallback.
     payloads: HashMap<BlockId, Vec<u8>>,
+    /// Lowest block id still retained; the low-water edge of the retention
+    /// window, advanced as old blocks are evicted so eviction stays O(evicted).
+    oldest_retained: BlockId,
 }
+
+/// How many of the most recently sent blocks the sender retains for possible
+/// NACK top-ups and reliable retransmits. A block older than this behind the
+/// send frontier has, in every convergent case, already been delivered or
+/// reliably retransmitted; retaining it further only grows memory without
+/// bound on long-lived connections. This window is large enough to cover many
+/// RTTs of in-flight blocks while keeping per-tunnel memory flat.
+const SENDER_RETAIN_BLOCKS: u64 = 1024;
 
 impl FecSender {
     pub fn new(stream_id: StreamId, symbol_size: u16, k: u32) -> Self {
@@ -279,6 +309,7 @@ impl FecSender {
             repair_sent: HashMap::new(),
             encoders: HashMap::new(),
             payloads: HashMap::new(),
+            oldest_retained: 0,
         }
     }
 
@@ -315,7 +346,29 @@ impl FecSender {
         // Retain the raw payload for a possible reliable-retransmit fallback.
         self.payloads.insert(block_id, payload.to_vec());
 
+        // Bound memory on long-lived connections: retire blocks that have fallen
+        // more than SENDER_RETAIN_BLOCKS behind the send frontier. Without this,
+        // encoders + payloads grow without limit for the life of the tunnel.
+        self.evict_old_blocks();
+
         symbols.into_iter().map(|s| s.datagram.freeze()).collect()
+    }
+
+    /// Drop retained state for blocks older than the retention window. Cheap:
+    /// only runs when the frontier advances past the window edge.
+    fn evict_old_blocks(&mut self) {
+        if self.next_block <= SENDER_RETAIN_BLOCKS {
+            return;
+        }
+        let cutoff = self.next_block - SENDER_RETAIN_BLOCKS;
+        // Retiring by exact id keeps this O(evicted) rather than scanning the
+        // whole map; the frontier advances by a handful of blocks per burst.
+        for block_id in self.oldest_retained..cutoff {
+            self.encoders.remove(&block_id);
+            self.repair_sent.remove(&block_id);
+            self.payloads.remove(&block_id);
+        }
+        self.oldest_retained = self.oldest_retained.max(cutoff);
     }
 
     /// Mint `extra` additional repair symbols for `block_id` in response to a
@@ -368,6 +421,11 @@ pub struct FecReceiver {
     /// Lets the receiver detect blocks that were *entirely* lost — no symbol
     /// ever arrived, so they have no manager — and request them reliably.
     total_blocks: Option<u64>,
+    /// Sender high-water mark from `HighWater`: the number of blocks the sender
+    /// has emitted so far (running, not terminal). Blocks `[0, high_water)`
+    /// provably exist even if no symbol for them ever arrived and no later block
+    /// followed, so this bounds the entirely-lost scan on idle streams.
+    high_water: u64,
     /// Blocks for which a reliable retransmit has already been requested, so the
     /// control tick does not re-request them every cycle while the reliable data
     /// is in flight.
@@ -384,6 +442,7 @@ impl FecReceiver {
             next_deliver: 0,
             highest_seen: 0,
             total_blocks: None,
+            high_water: 0,
             reliable_requested: std::collections::HashSet::new(),
         }
     }
@@ -394,17 +453,28 @@ impl FecReceiver {
         self.total_blocks = Some(total);
     }
 
+    /// Record the sender's running high-water mark (from `HighWater`). Monotonic:
+    /// only ever advances. Lets the entirely-lost scan reach a block whose every
+    /// datagram was lost and which no later block follows.
+    pub fn set_high_water(&mut self, blocks: u64) {
+        self.high_water = self.high_water.max(blocks);
+    }
+
     /// Feed one received symbol (already split from its datagram header).
     ///
     /// Returns any application bytes that became deliverable as a result —
     /// possibly zero (block not yet complete), possibly several blocks' worth
     /// (this symbol completed a block that unblocked a run of buffered ones).
+    ///
+    /// `budget` is the shared repair budget so the block manager can release any
+    /// reservation held for an outstanding NACK when this symbol makes progress.
     pub fn on_symbol(
         &mut self,
         block_id: BlockId,
         esi: u32,
         payload: &[u8],
         now: std::time::Instant,
+        budget: &raptun_fec::RepairBudget,
     ) -> Vec<u8> {
         // Blocks already delivered are ignored (late duplicates).
         if block_id < self.next_deliver {
@@ -419,7 +489,9 @@ impl FecReceiver {
             BlockManager::new(block_id, k, codec)
         });
 
-        if let raptun_fec::DecoderAction::Deliver { bytes } = mgr.on_symbol(now, esi, payload) {
+        if let raptun_fec::DecoderAction::Deliver { bytes } =
+            mgr.on_symbol(now, esi, payload, budget)
+        {
             self.managers.remove(&block_id);
             self.ready.insert(block_id, bytes);
         }
@@ -532,12 +604,22 @@ impl FecReceiver {
         // and have not yet been requested. These are invisible to the per-block
         // arbitration above (no manager exists), yet they hole the stream, so we
         // must request them reliably too. The upper bound is whatever we can
-        // prove exists: any block below the highest seen, and — once the total
-        // is known — any block below the total.
+        // prove exists: `highest_seen` is the id of the highest block for which a
+        // symbol arrived (so `highest_seen + 1` blocks exist by observation),
+        // `high_water` is the sender's announced running block count, and — once
+        // the stream ends — `total_blocks`. Using the reliable `high_water` here
+        // is what lets an entirely-lost block be recovered even when no later
+        // block ever arrives to advance `highest_seen`.
         let upper = {
-            let by_seen = self.highest_seen; // blocks [0, highest_seen) provably exist
+            let by_seen = if self.managers.is_empty() && self.highest_seen == 0 {
+                // No symbol has ever arrived; nothing observed to exist.
+                0
+            } else {
+                self.highest_seen + 1
+            };
+            let by_high_water = self.high_water;
             let by_total = self.total_blocks.unwrap_or(0);
-            by_seen.max(by_total)
+            by_seen.max(by_high_water).max(by_total)
         };
         for block_id in self.next_deliver..upper {
             if self.managers.contains_key(&block_id)
@@ -581,6 +663,15 @@ mod tests {
     const SYM: u16 = 128;
     const K: u32 = 6;
 
+    /// A permissive repair budget for receiver tests that don't exercise the
+    /// budget itself. Feeding symbols only ever *releases* against it, which is a
+    /// harmless no-op on a fresh budget.
+    fn test_budget() -> raptun_fec::RepairBudget {
+        let b = raptun_fec::RepairBudget::new(SYM, 0.4);
+        b.refresh_ceiling(10_000_000);
+        b
+    }
+
     /// Encode a multi-block message, drop ~1/3 of every block's symbols, and
     /// confirm the receiver reconstructs the whole message in order.
     #[test]
@@ -592,6 +683,7 @@ mod tests {
         let datagrams = sender.encode_blocks(&msg, K);
 
         let mut receiver = FecReceiver::new(SYM, K);
+        let budget = test_budget();
         let mut assembled = Vec::new();
         for (i, dg) in datagrams.iter().enumerate() {
             // Drop every third datagram to simulate loss.
@@ -599,7 +691,8 @@ mod tests {
                 continue;
             }
             let (hdr, payload) = SymbolHeader::parse(dg).unwrap();
-            let delivered = receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now());
+            let delivered =
+                receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now(), &budget);
             assembled.extend_from_slice(&delivered);
         }
 
@@ -619,10 +712,12 @@ mod tests {
         datagrams.reverse();
 
         let mut receiver = FecReceiver::new(SYM, K);
+        let budget = test_budget();
         let mut assembled = Vec::new();
         for dg in &datagrams {
             let (hdr, payload) = SymbolHeader::parse(dg).unwrap();
-            let delivered = receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now());
+            let delivered =
+                receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now(), &budget);
             assembled.extend_from_slice(&delivered);
         }
         assert_eq!(assembled, msg);
@@ -636,6 +731,7 @@ mod tests {
         let first = sender.encode_one_block(&payload, 0); // K source symbols only
 
         let mut receiver = FecReceiver::new(SYM, K);
+        let budget = test_budget();
         // Deliver only K-2 source symbols: not enough to decode.
         let mut assembled = Vec::new();
         for dg in first.iter().take((K - 2) as usize) {
@@ -645,6 +741,7 @@ mod tests {
                 hdr.esi,
                 pay,
                 Instant::now(),
+                &budget,
             ));
         }
         assert!(assembled.is_empty(), "should not decode yet");
@@ -658,6 +755,7 @@ mod tests {
                 hdr.esi,
                 pay,
                 Instant::now(),
+                &budget,
             ));
         }
         assert_eq!(
@@ -670,6 +768,7 @@ mod tests {
     fn tunnel_signal_round_trips() {
         let cases = [
             TunnelSignal::BlockCount { total: 12345 },
+            TunnelSignal::HighWater { blocks: 6789 },
             TunnelSignal::Nack {
                 block: 7,
                 have: 5,
@@ -726,24 +825,24 @@ mod tests {
 
         let mut receiver = FecReceiver::new(SYM, K);
         let t0 = Instant::now();
+        // Budget with headroom; link is random-loss (FEC-appropriate) and enough
+        // wall-clock has passed to exceed the stall grace period.
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(10_000_000);
 
         // Deliver K-3 symbols of block 0 (not enough).
         for dg in b0.iter().take((K - 3) as usize) {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0);
+            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
         }
         // Deliver block 1 fully; it decodes but cannot be delivered yet (block 0
         // is still missing and delivery is in-order). This does NOT advance the
         // delivery floor past block 0.
         for dg in &b1 {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0);
+            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
         }
 
-        // Budget with headroom; link is random-loss (FEC-appropriate) and enough
-        // wall-clock has passed to exceed the stall grace period.
-        let budget = RepairBudget::new(SYM, 0.4);
-        budget.refresh_ceiling(10_000_000);
         let link = LinkState::new(
             Duration::from_millis(20),
             Duration::from_millis(5),
@@ -783,7 +882,7 @@ mod tests {
         let mut delivered = Vec::new();
         for dg in &extra {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.esi, p, later));
+            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.esi, p, later, &budget));
         }
         // Block 0 completes, unblocking in-order delivery of both blocks.
         let mut expected = payload0.clone();
@@ -811,21 +910,21 @@ mod tests {
 
         let mut receiver = FecReceiver::new(SYM, K);
         let t0 = Instant::now();
-        // One symbol of block 0 (far from decodable).
-        {
-            let (h, p) = SymbolHeader::parse(&b0[0]).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0);
-        }
-        // Deliver block 1 fully (decodes but buffered behind block 0).
-        for dg in &b1 {
-            let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0);
-        }
-
         // Budget of zero: no repair may be requested, so the manager must
         // degrade block 0 to a reliable retransmit.
         let budget = RepairBudget::new(SYM, 0.4);
         budget.refresh_ceiling(0); // ceiling 0 ⇒ nothing fits
+                                   // One symbol of block 0 (far from decodable).
+        {
+            let (h, p) = SymbolHeader::parse(&b0[0]).unwrap();
+            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+        }
+        // Deliver block 1 fully (decodes but buffered behind block 0).
+        for dg in &b1 {
+            let (h, p) = SymbolHeader::parse(dg).unwrap();
+            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+        }
+
         let link = LinkState::new(
             Duration::from_millis(20),
             Duration::from_millis(5),
@@ -866,6 +965,109 @@ mod tests {
         assert_eq!(
             delivered, expected,
             "reliable retransmit converges the stream"
+        );
+    }
+
+    /// Regression for the "runs then freezes" stall: a block whose *every*
+    /// datagram is lost, with no later block ever arriving (interactive
+    /// request/response), must still be recovered. Without the `HighWater`
+    /// signal the receiver never learns the block exists — `highest_seen` never
+    /// reaches it and no EOF sets `total_blocks` — so the entirely-lost scan
+    /// skips it and the stream strands forever while QUIC keepalives keep
+    /// flowing. With `set_high_water`, the tick requests it reliably.
+    #[test]
+    fn entirely_lost_block_recovered_via_high_water_when_idle() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload0: Vec<u8> = (0..300).map(|i| (i % 200) as u8).collect();
+        let payload1: Vec<u8> = (0..300).map(|i| (i % 190) as u8).collect();
+        // Two blocks are produced and their high-water announced, but block 1's
+        // datagrams are ALL dropped and no block 2 ever follows.
+        let b0 = sender.encode_one_block(&payload0, 0);
+        let _b1_all_lost = sender.encode_one_block(&payload1, 0);
+
+        let mut receiver = FecReceiver::new(SYM, K);
+        let budget = test_budget();
+        let t0 = Instant::now();
+
+        // Deliver block 0 fully so it is delivered and next_deliver advances to 1.
+        let mut delivered = Vec::new();
+        for dg in &b0 {
+            let (h, p) = SymbolHeader::parse(dg).unwrap();
+            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.esi, p, t0, &budget));
+        }
+        assert_eq!(delivered, payload0, "block 0 delivered");
+        assert_eq!(receiver.highest_delivered(), 1);
+
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.2,
+            10_000_000,
+            LossRegime::Random,
+        );
+        let later = t0 + Duration::from_secs(1);
+
+        // Without the high-water hint the receiver cannot know block 1 exists:
+        // no symbol arrived for it and there is no higher block. The scan finds
+        // nothing to do.
+        assert!(
+            receiver.tick(&link, &budget, later).is_empty(),
+            "without high-water, an idle entirely-lost block is invisible"
+        );
+
+        // The sender's high-water announcement (2 blocks emitted) reaches the
+        // receiver over the reliable stream.
+        receiver.set_high_water(2);
+
+        // Now the tick recognizes block 1 exists but has no symbols, and requests
+        // it reliably — the escape from the permanent stall.
+        let signals = receiver.tick(&link, &budget, later);
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, TunnelSignal::ReliableRequest { block: 1 })),
+            "high-water must trigger reliable recovery of the entirely-lost block: {signals:?}"
+        );
+
+        // Serve it and confirm the stream converges.
+        let bytes = sender.reliable_payload(1).expect("sender retains block 1");
+        let out = receiver.on_reliable_block(1, bytes);
+        assert_eq!(
+            out, payload1,
+            "reliable retransmit completes the lost block"
+        );
+        assert_eq!(receiver.highest_delivered(), 2, "stream advanced past hole");
+    }
+
+    /// The sender must not retain block state without bound on a long-lived
+    /// connection. After sending far more than the retention window, only the
+    /// most recent blocks remain answerable; ancient blocks are evicted.
+    #[test]
+    fn sender_retention_is_bounded() {
+        let mut sender = FecSender::new(1, SYM, 2);
+        let payload = vec![0xABu8; sender.block_payload()];
+        let total = SENDER_RETAIN_BLOCKS + 50;
+        for _ in 0..total {
+            let _ = sender.encode_one_block(&payload, 0);
+        }
+        // The oldest blocks are gone (return None), the newest are retained.
+        assert!(
+            sender.reliable_payload(0).is_none(),
+            "ancient block must be evicted"
+        );
+        assert!(
+            sender.reliable_payload(total - 1).is_some(),
+            "most recent block must be retained"
+        );
+        // Retained maps stay within the window (plus the block just added).
+        assert!(
+            sender.payloads.len() as u64 <= SENDER_RETAIN_BLOCKS + 1,
+            "retained payloads bounded by the window, got {}",
+            sender.payloads.len()
         );
     }
 }
