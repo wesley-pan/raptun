@@ -187,6 +187,7 @@ impl Cli {
             use_datagrams: self.datagram,
             stream_recv_window: self.stream_rwnd,
             conn_recv_window: self.conn_rwnd,
+            max_concurrent_streams: self.max_streams,
             socket_buffer: self.sockbuf,
             keepalive: (self.keepalive > 0).then(|| Duration::from_secs(self.keepalive)),
             idle_timeout: Duration::from_secs(self.idle_timeout),

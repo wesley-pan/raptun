@@ -45,6 +45,14 @@ pub fn build_transport(cfg: &TransportConfig) -> Result<Arc<QuinnTransport>> {
     t.stream_receive_window(to_varint(cfg.stream_recv_window)?);
     t.receive_window(to_varint(cfg.conn_recv_window)?);
 
+    // Concurrent bidi-stream cap. Each tunnel holds one bidi stream open for the
+    // life of its local TCP connection, so this bounds simultaneous tunnels. The
+    // Quinn default is only 100 — far too low for browser traffic — and once it
+    // is reached the peer's `open_bi()` blocks until a stream closes, which reads
+    // as new connections stalling until an old one times out. Applied on both
+    // ends so each side grants the other enough credit.
+    t.max_concurrent_bidi_streams(to_varint(u64::from(cfg.max_concurrent_streams))?);
+
     // Idle timeout and keep-alive. Keep-alive must be well under the idle
     // timeout or an otherwise-healthy connection could still time out.
     let idle = IdleTimeout::try_from(cfg.idle_timeout)
