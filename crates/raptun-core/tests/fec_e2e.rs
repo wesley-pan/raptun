@@ -525,6 +525,7 @@ async fn client_emits_periodic_heartbeat() {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter("raptun_core=info")
         .with_writer(BufWriter(buf.clone()))
+        .with_ansi(false)
         .finish();
     let _log_guard = tracing::subscriber::set_default(subscriber);
 
@@ -582,4 +583,163 @@ async fn client_emits_periodic_heartbeat() {
         beats >= 2,
         "heartbeat must recur (rolling output); saw {beats} in logs:\n{logs}"
     );
+}
+
+/// A target that reads the first request, sends one response, then half-closes
+/// its *write* side (shutdown) while leaving the read side open. This drives the
+/// tunnel's `down` direction to completion (the response's block count is fully
+/// delivered and the peer's write half is done) *before* the `up` direction sees
+/// EOF — the local client socket is still open. Returns its bound address.
+async fn spawn_respond_then_halfclose() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                // Wait for the first request bytes.
+                if let Ok(n) = sock.read(&mut buf).await {
+                    if n > 0 {
+                        let up: Vec<u8> = buf[..n].iter().map(|b| b.to_ascii_uppercase()).collect();
+                        let _ = sock.write_all(&up).await;
+                    }
+                }
+                // Half-close the write side; keep the read side open so the peer
+                // does not see a full connection close.
+                let _ = sock.shutdown().await;
+                // Hold the socket open a while so the read half stays alive.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Regression for the shutdown-signal lost-wakeup: when the `down` direction of
+/// a FEC tunnel completes *before* `up` reaches its post-EOF wait, `up` must
+/// still observe the finished signal and unwind, so the tunnel task ends and
+/// `active_tunnels` drains back to 0.
+///
+/// The target responds then half-closes its write side, so the server announces
+/// its block count immediately and the client's `down` finishes early — before
+/// the local app closes and the client's `up` reaches its post-EOF loop. A
+/// `Notify`-based signal (the earlier fix) loses the wakeup fired in that window
+/// and `up` hangs forever; the `oneshot` buffers it so `up` unblocks regardless
+/// of ordering. We drive one such request/response, close the local socket, and
+/// assert the heartbeat's `active_tunnels` rises to >=1 and then returns to 0.
+#[tokio::test(flavor = "current_thread")]
+async fn tunnel_drains_when_downstream_finishes_before_upstream_eof() {
+    let _guard = E2E_LOCK.lock().await;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("raptun_core=info")
+        .with_writer(BufWriter(buf.clone()))
+        .with_ansi(false)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    run_downstream_first_scenario().await;
+
+    let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let counts: Vec<u64> = logs
+        .lines()
+        .filter(|l| l.contains("tunnel alive"))
+        .filter_map(|l| {
+            l.split("active_tunnels=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    // The tunnel must have gone active (>=1 while serving) and then drained back
+    // to 0 in a *later* heartbeat. With the buggy Notify signal the wakeup is
+    // lost, `up` hangs, and the count stays pinned at 1 forever (never returns
+    // to 0 after rising). The trivial startup 0 (before the connection opens)
+    // does not satisfy this because it precedes the rise.
+    let rose = counts.iter().position(|&c| c >= 1);
+    let drained_after_rise = rose
+        .map(|i| counts[i..].iter().any(|&c| c == 0))
+        .unwrap_or(false);
+    assert!(
+        drained_after_rise,
+        "tunnel must go active then drain to 0 after downstream finishes first; \
+         active_tunnels sequence = {counts:?}\nlogs:\n{logs}"
+    );
+}
+
+/// Body of [`tunnel_drains_when_downstream_finishes_before_upstream_eof`]: drive
+/// one request/response where the target half-closes first (so the client's
+/// `down` finishes before `up` sees EOF), then close the local socket.
+async fn run_downstream_first_scenario() {
+    let target_addr = spawn_respond_then_halfclose().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+
+    // FEC path so run_fec_tunnel (with the shutdown signal) is exercised.
+    let mut cfg = fec_config();
+    cfg.transport.heartbeat = Some(Duration::from_millis(300));
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_addr = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+            .unwrap();
+        ep.local_addr().unwrap()
+    };
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, target_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let local_addr = {
+        let l = TcpListener::bind(local_bind).await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Open a tunnel, send one request, read the echoed response. The target
+    // half-closes right after responding, so the client's `down` completes early
+    // (server announced its block count) — before we close the local socket and
+    // the client's `up` reaches its post-EOF wait. That ordering is what loses a
+    // Notify wakeup.
+    {
+        let mut conn = connect_with_retry(local_addr).await;
+        conn.write_all(b"hello half-close").await.unwrap();
+        let mut resp = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut resp))
+            .await
+            .expect("response read timed out")
+            .expect("response read failed");
+        assert_eq!(&resp[..n], b"HELLO HALF-CLOSE", "response must round-trip");
+        // Give `down` a moment to finish first, then close our side so `up` hits
+        // EOF and reaches its post-EOF wait *after* the signal already fired.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Dropping `conn` closes the local socket → `up` sees EOF.
+    }
+
+    // Allow several heartbeats so we capture the rise to active and the drain to 0.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 }
