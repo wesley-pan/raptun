@@ -131,6 +131,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     pub conn_rwnd: u64,
 
+    /// Maximum concurrent tunnelled streams (QUIC bidi streams) per connection.
+    /// Each live tunnel holds one, so this caps simultaneous tunnels. The QUIC
+    /// default of 100 is easily exceeded by browser traffic, causing new
+    /// connections to stall until an old stream closes.
+    #[arg(long, default_value_t = 1024)]
+    pub max_streams: u32,
+
     /// UDP socket buffer size (bytes).
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     pub sockbuf: u32,
@@ -221,6 +228,7 @@ impl Cli {
             use_datagrams: self.datagram,
             stream_recv_window: self.stream_rwnd,
             conn_recv_window: self.conn_rwnd,
+            max_concurrent_streams: self.max_streams,
             socket_buffer: self.sockbuf,
             keepalive: (self.keepalive > 0).then(|| Duration::from_secs(self.keepalive)),
             idle_timeout: Duration::from_secs(self.idle_timeout),

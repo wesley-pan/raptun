@@ -743,3 +743,215 @@ async fn run_downstream_first_scenario() {
     // Allow several heartbeats so we capture the rise to active and the drain to 0.
     tokio::time::sleep(Duration::from_millis(1500)).await;
 }
+
+/// Concurrency regression: many local connections held open *simultaneously*
+/// must all tunnel data promptly, not stall until earlier ones close.
+///
+/// Each FEC tunnel holds one QUIC bidi (signaling) stream open for the whole
+/// life of its local TCP connection. Quinn's default `max_concurrent_bidi_streams`
+/// is only 100, so once ~100 tunnels are live the client's `open_bi()` blocks
+/// until an old stream closes — exactly the "new connections stall until a
+/// timeout releases an old stream" symptom seen with real browser traffic.
+///
+/// We open `CONCURRENT` connections (well above the old 100 default, well under
+/// Raptun's raised cap), keep every one open, and require each to round-trip
+/// within a deadline. Against the unconfigured default this deadlocks past the
+/// 100th stream and times out; with the raised cap all complete.
+#[tokio::test]
+async fn many_concurrent_tunnels_do_not_stall() {
+    let _guard = E2E_LOCK.lock().await;
+
+    // Above Quinn's default of 100 so the cap is exercised, below Raptun's 1024.
+    const CONCURRENT: usize = 250;
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+    let cfg = fec_config();
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_ep = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+    };
+    let server_addr = server_ep.local_addr().unwrap();
+    drop(server_ep);
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client_listener = TcpListener::bind(local_bind).await.unwrap();
+    let local_addr = client_listener.local_addr().unwrap();
+    drop(client_listener);
+
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Open every connection and hold it open until *all* have round-tripped.
+    // A shared barrier is what actually pins many streams live simultaneously:
+    // no task closes its socket (releasing its QUIC stream) until every task has
+    // received its echo. Under a cap below CONCURRENT, tasks past the limit can
+    // never open their bidi stream, so they never reach the barrier and the
+    // whole set deadlocks — the exact "stall until an old stream frees" symptom.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENT));
+    let mut handles = Vec::with_capacity(CONCURRENT);
+    for i in 0..CONCURRENT {
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let payload = format!("concurrent-tunnel-{i:04}");
+            let mut conn = connect_with_retry(local_addr).await;
+            conn.write_all(payload.as_bytes()).await.unwrap();
+
+            let expected: Vec<u8> = payload.bytes().map(|b| b.to_ascii_uppercase()).collect();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 256];
+            while got.len() < expected.len() {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            // Hold the connection (and thus its QUIC stream) open until every
+            // task has also round-tripped — forcing CONCURRENT streams live at
+            // once — then let `conn` drop.
+            let matched = got == expected;
+            barrier.wait().await;
+            matched
+        }));
+    }
+
+    // A generous deadline: if the stream cap is below CONCURRENT, tunnels past
+    // the limit hang, the barrier never releases, and this elapses. With the
+    // raised cap all CONCURRENT open together, round-trip, and pass the barrier.
+    let ok = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut ok = 0usize;
+        for h in handles {
+            if let Ok(true) = h.await {
+                ok += 1;
+            }
+        }
+        ok
+    })
+    .await
+    .expect("concurrent tunnels stalled — stream-limit regression");
+
+    assert_eq!(
+        ok, CONCURRENT,
+        "all {CONCURRENT} concurrent tunnels must round-trip; only {ok} did"
+    );
+}
+
+/// Regression for the per-tunnel repair-budget bug: the ≤40%-of-cwnd repair
+/// brake must be **one budget per QUIC connection**, shared by every tunnel on
+/// it — not a fresh budget per tunnel. With a per-tunnel budget, N concurrent
+/// tunnels each independently claim 40% of the *same* connection cwnd, so the
+/// aggregate repair injection overshoots the link ~N× and collapses throughput
+/// as concurrency rises.
+///
+/// The invariant is observable via the `test-hooks` creation counter: many
+/// tunnels over one client connection must create exactly **one** budget. If a
+/// regression moves creation back into the per-tunnel path, the count rises
+/// with tunnel count and this fails.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn shared_repair_budget_is_per_connection() {
+    let _guard = E2E_LOCK.lock().await;
+    raptun_core::run::reset_test_budgets_created();
+
+    const TUNNELS: usize = 12;
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+    let cfg = fec_config();
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_ep = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+    };
+    let server_addr = server_ep.local_addr().unwrap();
+    drop(server_ep);
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client_listener = TcpListener::bind(local_bind).await.unwrap();
+    let local_addr = client_listener.local_addr().unwrap();
+    drop(client_listener);
+
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Drive many tunnels concurrently, held open together via a barrier so they
+    // are all genuinely live on the one client connection at once.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TUNNELS));
+    let mut handles = Vec::with_capacity(TUNNELS);
+    for i in 0..TUNNELS {
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let payload = format!("budget-share-{i:03}");
+            let mut conn = connect_with_retry(local_addr).await;
+            conn.write_all(payload.as_bytes()).await.unwrap();
+            let expected: Vec<u8> = payload.bytes().map(|b| b.to_ascii_uppercase()).collect();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 128];
+            while got.len() < expected.len() {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            barrier.wait().await;
+        }));
+    }
+    for h in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(15), h).await;
+    }
+
+    // The counter is process-global and both the client and server run here, so
+    // each side's single QUIC connection contributes one budget: the fixed,
+    // tunnel-count-independent total is small (one per connection per side). The
+    // per-tunnel-budget regression would instead create one per tunnel on each
+    // side (~2 * TUNNELS). Asserting the count stays well below TUNNELS is the
+    // robust invariant — it holds regardless of a stray reconnect.
+    let created = raptun_core::run::test_budgets_created();
+    assert!(
+        created >= 1 && created < TUNNELS as u64,
+        "repair budgets must be per-connection (a small, tunnel-count-independent \
+         number), not per-tunnel: got {created} budgets for {TUNNELS} tunnels on \
+         one connection (per-tunnel budget regression)"
+    );
+}

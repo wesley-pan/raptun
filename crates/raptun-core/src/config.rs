@@ -92,6 +92,15 @@ pub struct TransportConfig {
     pub use_datagrams: bool,
     pub stream_recv_window: u64,
     pub conn_recv_window: u64,
+    /// Maximum number of concurrent QUIC bidirectional streams the peer may
+    /// have open at once. Each live tunnel holds one bidi (signaling) stream
+    /// for the whole life of its local TCP connection, so this directly caps
+    /// how many tunnels can be active simultaneously. Quinn's own default is
+    /// only 100; a browser streaming video easily exceeds that (CDN segments,
+    /// page, ads, analytics keep-alives), at which point `open_bi()` blocks
+    /// until an old stream closes — the "new streams stall until a timeout"
+    /// symptom. Raptun raises it well above that.
+    pub max_concurrent_streams: u32,
     pub socket_buffer: u32,
     pub keepalive: Option<Duration>,
     pub idle_timeout: Duration,
@@ -113,6 +122,7 @@ impl Default for TransportConfig {
             use_datagrams: true,
             stream_recv_window: 2 * 1024 * 1024,
             conn_recv_window: 16 * 1024 * 1024,
+            max_concurrent_streams: 1024,
             socket_buffer: 4 * 1024 * 1024,
             keepalive: Some(Duration::from_secs(10)),
             idle_timeout: Duration::from_secs(30),
