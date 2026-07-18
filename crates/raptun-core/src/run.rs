@@ -169,10 +169,33 @@ async fn serve_connection(
                 handle_client_conn(&conn, tcp).await
             };
             if let Err(e) = res {
-                tracing::warn!(error = %e, "client tunnel closed with error");
+                if is_benign_local_close(&e) {
+                    // The local application (browser tab, cancelled request,
+                    // expired keep-alive) hung up while we still had downstream
+                    // bytes to hand it. Routine for interactive traffic — log at
+                    // debug so genuine failures stay visible at warn.
+                    tracing::debug!(error = %e, "client tunnel closed (local peer hung up)");
+                } else {
+                    tracing::warn!(error = %e, "client tunnel closed with error");
+                }
             }
         });
     }
+}
+
+/// Whether a tunnel error is just the local peer closing its socket while we
+/// still had data to deliver — expected churn for browser/interactive traffic,
+/// not a fault worth a warning.
+fn is_benign_local_close(err: &CoreError) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err,
+        CoreError::Io(io)
+            if matches!(
+                io.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            )
+    )
 }
 
 /// Decrements the active-tunnel counter when a tunnel task ends, on any path.
@@ -316,7 +339,11 @@ async fn handle_server_conn(
                         tunnel_bi(tcp, send, recv).await
                     };
                     if let Err(e) = res {
-                        tracing::warn!(error = %e, "server tunnel closed with error");
+                        if is_benign_local_close(&e) {
+                            tracing::debug!(error = %e, "server tunnel closed (target hung up)");
+                        } else {
+                            tracing::warn!(error = %e, "server tunnel closed with error");
+                        }
                     }
                 }
                 Err(e) => tracing::warn!(%target, error = %e, "failed to reach target"),
