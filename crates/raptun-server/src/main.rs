@@ -7,13 +7,15 @@ mod cli;
 
 use std::net::ToSocketAddrs;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::Cli;
 use raptun_core::tls::ServerIdentity;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut args = Cli::from_arg_matches(&matches)?;
+    args.merge_file(&matches)?;
     init_tracing(&args.log_level, args.quiet);
 
     let config = args.to_runtime_config();
