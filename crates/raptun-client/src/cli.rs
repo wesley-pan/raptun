@@ -494,6 +494,9 @@ impl Cli {
             socket_buffer: self.sockbuf,
             keepalive: (self.keepalive > 0).then(|| Duration::from_secs(self.keepalive)),
             idle_timeout: Duration::from_secs(self.idle_timeout),
+            // Server-only forwarding knob; the client never connects to a
+            // target, so keep the default rather than exposing a dead flag.
+            target_connect_timeout: TransportConfig::default().target_connect_timeout,
             allow_migration: self.migration,
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,

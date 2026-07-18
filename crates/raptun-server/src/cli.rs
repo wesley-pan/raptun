@@ -115,6 +115,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 30)]
     pub idle_timeout: u64,
 
+    /// Seconds to wait for a TCP connection to the forwarding target before
+    /// giving up on a tunnel. On timeout the tunnel's QUIC stream is reset so
+    /// the client unwinds promptly instead of hanging until the idle timeout.
+    #[arg(long, default_value_t = 10)]
+    pub connect_timeout: u64,
+
     #[arg(long, default_value_t = true)]
     pub migration: bool,
 
@@ -199,6 +205,7 @@ pub struct FileTransport {
     pub sockbuf: Option<u32>,
     pub keepalive: Option<u64>,
     pub idle_timeout: Option<u64>,
+    pub connect_timeout: Option<u64>,
     pub migration: Option<bool>,
     pub zero_rtt: Option<bool>,
     pub dscp: Option<u8>,
@@ -370,6 +377,11 @@ impl Cli {
                 self.idle_timeout = v;
             }
         }
+        if from_default("connect_timeout") {
+            if let Some(v) = file.transport.connect_timeout {
+                self.connect_timeout = v;
+            }
+        }
         if from_default("migration") {
             if let Some(v) = file.transport.migration {
                 self.migration = v;
@@ -429,6 +441,7 @@ impl Cli {
             socket_buffer: self.sockbuf,
             keepalive: (self.keepalive > 0).then(|| Duration::from_secs(self.keepalive)),
             idle_timeout: Duration::from_secs(self.idle_timeout),
+            target_connect_timeout: Duration::from_secs(self.connect_timeout),
             allow_migration: self.migration,
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,

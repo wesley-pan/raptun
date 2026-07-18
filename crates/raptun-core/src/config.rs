@@ -104,6 +104,14 @@ pub struct TransportConfig {
     pub socket_buffer: u32,
     pub keepalive: Option<Duration>,
     pub idle_timeout: Duration,
+    /// How long the server waits for a TCP connection to its forwarding target
+    /// before giving up on one tunnel. Without a bound, an unreachable target
+    /// leaves each tunnel's `connect()` parked on the OS default (~130 s on
+    /// Linux) while its QUIC stream stays open, so tunnels pile up
+    /// (`active_tunnels` climbs) and the client waits with no error. On timeout
+    /// the server resets that stream so the client's side unwinds promptly.
+    /// Server-only; ignored by the client.
+    pub target_connect_timeout: Duration,
     pub allow_migration: bool,
     pub allow_0rtt: bool,
     pub dscp: u8,
@@ -126,6 +134,7 @@ impl Default for TransportConfig {
             socket_buffer: 4 * 1024 * 1024,
             keepalive: Some(Duration::from_secs(10)),
             idle_timeout: Duration::from_secs(30),
+            target_connect_timeout: Duration::from_secs(10),
             allow_migration: true,
             allow_0rtt: true,
             dscp: 0,
