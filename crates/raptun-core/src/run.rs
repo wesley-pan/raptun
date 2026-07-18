@@ -134,6 +134,14 @@ async fn serve_connection(
         tracing::info!("data path: reliable QUIC streams (FEC off)");
     }
 
+    // One repair budget per QUIC *connection*, shared by every tunnel on it.
+    // The budget is the ≤40%-of-cwnd brake on in-flight repair symbols; since
+    // all tunnels share this one connection's cwnd, they must also share one
+    // budget, or N tunnels each independently claim 40% of the same cwnd and
+    // the aggregate repair injection overshoots the link by a factor of N —
+    // self-inflicted congestion that collapses throughput as concurrency rises.
+    let budget = new_conn_budget(&conn, &fec, config);
+
     // Count of currently-live tunnels, surfaced by the heartbeat. Each accepted
     // connection increments it and a guard decrements on completion.
     let active = Arc::new(AtomicU64::new(0));
@@ -156,15 +164,15 @@ async fn serve_connection(
         let conn = Arc::clone(&conn);
         let hub = hub.clone();
         let fec = fec.clone();
-        let config = Arc::clone(config);
         let active = Arc::clone(&active);
+        let budget = Arc::clone(&budget);
         tokio::spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
             active.fetch_add(1, Ordering::Relaxed);
             let _guard = ActiveGuard(&active);
             let res = if use_fec {
-                handle_client_conn_fec(&conn, &hub, &fec, &config, tcp).await
+                handle_client_conn_fec(&conn, &hub, &fec, &budget, tcp).await
             } else {
                 handle_client_conn(&conn, tcp).await
             };
@@ -256,14 +264,14 @@ async fn handle_client_conn_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
     fec: &FecParams,
-    config: &RuntimeConfig,
+    budget: &Arc<raptun_fec::RepairBudget>,
     tcp: TcpStream,
 ) -> Result<()> {
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| CoreError::Endpoint(format!("open signaling bi: {e}")))?;
-    client_tunnel_fec(conn, hub, fec, config, tcp, send, recv).await
+    client_tunnel_fec(conn, hub, fec, budget, tcp, send, recv).await
 }
 
 /// Run the server: listen for QUIC connections, run the handshake on each, and
@@ -318,6 +326,11 @@ async fn handle_server_conn(
         spawn_datagram_reader(Arc::clone(&conn), hub.clone());
     }
 
+    // One repair budget per QUIC connection, shared by every tunnel on it — the
+    // ≤40%-of-cwnd brake operates over the whole connection, not per tunnel (see
+    // the matching comment in `serve_connection`).
+    let budget = new_conn_budget(&conn, &fec, &config);
+
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
@@ -329,12 +342,12 @@ async fn handle_server_conn(
         let conn = Arc::clone(&conn);
         let hub = hub.clone();
         let fec = fec.clone();
-        let config = Arc::clone(&config);
+        let budget = Arc::clone(&budget);
         tokio::spawn(async move {
             match TcpStream::connect(target).await {
                 Ok(tcp) => {
                     let res = if use_fec {
-                        server_tunnel_fec(&conn, &hub, &fec, &config, tcp, send, recv).await
+                        server_tunnel_fec(&conn, &hub, &fec, &budget, tcp, send, recv).await
                     } else {
                         tunnel_bi(tcp, send, recv).await
                     };
@@ -359,6 +372,43 @@ async fn handle_server_conn(
 /// Whether the negotiated config uses the RaptorQ FEC scheme.
 fn fec_enabled(config: &RuntimeConfig) -> bool {
     matches!(config.fec.scheme, crate::config::FecScheme::RaptorQ)
+}
+
+/// Build the single per-connection [`raptun_fec::RepairBudget`] that every FEC
+/// tunnel on this QUIC connection shares. Called exactly once per connection
+/// (in `serve_connection` / `handle_server_conn`), never per tunnel — see the
+/// budget-sharing rationale where it is called.
+fn new_conn_budget(
+    conn: &quinn::Connection,
+    fec: &FecParams,
+    config: &RuntimeConfig,
+) -> Arc<raptun_fec::RepairBudget> {
+    #[cfg(feature = "test-hooks")]
+    TEST_BUDGETS_CREATED.fetch_add(1, Ordering::Relaxed);
+    Arc::new(raptun_fec::RepairBudget::new(
+        effective_symbol_size(conn, fec.symbol_size),
+        config.fec.repair_cwnd_fraction,
+    ))
+}
+
+/// Test-only counter of how many per-connection repair budgets have been
+/// created. The invariant is *one budget per QUIC connection* — a regression
+/// that moves budget creation back inside the per-tunnel path would make this
+/// climb with tunnel count instead of connection count. See the
+/// `shared_repair_budget_is_per_connection` test.
+#[cfg(feature = "test-hooks")]
+static TEST_BUDGETS_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the number of per-connection repair budgets created so far.
+#[cfg(feature = "test-hooks")]
+pub fn test_budgets_created() -> u64 {
+    TEST_BUDGETS_CREATED.load(Ordering::Relaxed)
+}
+
+/// Reset the per-connection repair-budget creation counter.
+#[cfg(feature = "test-hooks")]
+pub fn reset_test_budgets_created() {
+    TEST_BUDGETS_CREATED.store(0, Ordering::Relaxed);
 }
 
 /// Resolve a concrete source-block symbol count K from negotiated params,
@@ -410,7 +460,7 @@ async fn client_tunnel_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
     fec: &FecParams,
-    config: &RuntimeConfig,
+    budget: &Arc<raptun_fec::RepairBudget>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
@@ -425,7 +475,7 @@ async fn client_tunnel_fec(
     let inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "client FEC tunnel opened");
     let res = run_fec_tunnel(
-        conn, fec, config, stream_id, tcp, sig_send, sig_recv, inbound,
+        conn, fec, budget, stream_id, tcp, sig_send, sig_recv, inbound,
     )
     .await;
     hub.unregister(stream_id);
@@ -438,7 +488,7 @@ async fn server_tunnel_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
     fec: &FecParams,
-    config: &RuntimeConfig,
+    budget: &Arc<raptun_fec::RepairBudget>,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
@@ -453,7 +503,7 @@ async fn server_tunnel_fec(
     let inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "server FEC tunnel opened");
     let res = run_fec_tunnel(
-        conn, fec, config, stream_id, tcp, sig_send, sig_recv, inbound,
+        conn, fec, budget, stream_id, tcp, sig_send, sig_recv, inbound,
     )
     .await;
     hub.unregister(stream_id);
@@ -479,7 +529,7 @@ async fn server_tunnel_fec(
 async fn run_fec_tunnel(
     conn: &quinn::Connection,
     fec: &FecParams,
-    config: &RuntimeConfig,
+    budget: &Arc<raptun_fec::RepairBudget>,
     stream_id: StreamId,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
@@ -665,11 +715,12 @@ async fn run_fec_tunnel(
     };
 
     // --- Downstream: FEC datagrams -> TCP, with periodic convergence tick. ---
-    // Repair budget shared by every block's arbitration (the in-flight brake).
-    let budget = std::sync::Arc::new(raptun_fec::RepairBudget::new(
-        symbol_size,
-        config.fec.repair_cwnd_fraction,
-    ));
+    // Repair budget: the connection-wide brake, shared by every tunnel on this
+    // QUIC connection (created once per connection in `serve_connection` /
+    // `handle_server_conn` and threaded in). Cloning the `Arc` shares the one
+    // atomic in-flight counter and ceiling, so the ≤40%-of-cwnd cap applies to
+    // the aggregate repair across all tunnels rather than per tunnel.
+    let budget = Arc::clone(budget);
     let down_conn = conn.clone();
     let down_sig = sig_tx.clone();
     let mut classifier = crate::telemetry::RegimeClassifier::new();
