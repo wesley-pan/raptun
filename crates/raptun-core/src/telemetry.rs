@@ -77,16 +77,6 @@ impl RegimeClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn sample(cwnd: u64, loss: f64) -> TransportSample {
-        TransportSample {
-            smoothed_rtt: Duration::from_millis(80),
-            rtt_var: Duration::from_millis(20),
-            cwnd_bytes: cwnd,
-            loss_rate: loss,
-        }
-    }
 
     #[test]
     fn cwnd_cut_is_congestion() {

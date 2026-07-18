@@ -664,9 +664,7 @@ async fn tunnel_drains_when_downstream_finishes_before_upstream_eof() {
     // to 0 after rising). The trivial startup 0 (before the connection opens)
     // does not satisfy this because it precedes the rise.
     let rose = counts.iter().position(|&c| c >= 1);
-    let drained_after_rise = rose
-        .map(|i| counts[i..].iter().any(|&c| c == 0))
-        .unwrap_or(false);
+    let drained_after_rise = rose.map(|i| counts[i..].contains(&0)).unwrap_or(false);
     assert!(
         drained_after_rise,
         "tunnel must go active then drain to 0 after downstream finishes first; \
@@ -954,4 +952,103 @@ async fn shared_repair_budget_is_per_connection() {
          number), not per-tunnel: got {created} budgets for {TUNNELS} tunnels on \
          one connection (per-tunnel budget regression)"
     );
+}
+
+/// A payload far larger than Quinn's 1 MiB default datagram send buffer must
+/// round-trip intact over the clean loopback link.
+///
+/// Regression guard for the send-buffer overflow stall: `send_datagram` uses
+/// `drop = true`, so once a large burst overflows the outgoing buffer it
+/// silently evicts the oldest queued, still-unsent symbols. With repair floored
+/// at 1/block on a clean link those blocks can't self-heal, degrade to reliable
+/// retransmit, and the un-paced sender stalls — `live_size_sweep.sh` pinned a
+/// hard delivery cliff at exactly the 1 MiB buffer. The fix back-pressures the
+/// send loop (`send_datagram_paced`) and enlarges the buffer; this drives 4 MiB
+/// (well past that cliff) with zero injected loss and requires full delivery.
+#[tokio::test]
+async fn large_payload_survives_send_buffer_pressure() {
+    let _guard = E2E_LOCK.lock().await;
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+    let cfg = fec_config();
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_ep = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+    };
+    let server_addr = server_ep.local_addr().unwrap();
+    drop(server_ep);
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client_listener = TcpListener::bind(local_bind).await.unwrap();
+    let local_addr = client_listener.local_addr().unwrap();
+    drop(client_listener);
+
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 4 MiB: 4x the 1 MiB default send buffer, so a burst that overflows it is
+    // guaranteed. A deterministic byte pattern lets us assert integrity, not
+    // just length.
+    const PAYLOAD_LEN: usize = 4 * 1024 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+
+    let conn = connect_with_retry(local_addr).await;
+    let (mut read_half, mut write_half) = conn.into_split();
+    // Write concurrently with the read: a 4 MiB payload exceeds the TCP socket
+    // buffer, so the writer blocks on back-pressure until the reader drains the
+    // echo. Driving both at once is what actually exercises the large in-flight
+    // burst through the tunnel.
+    let writer_payload = payload.clone();
+    let writer = tokio::spawn(async move {
+        write_half.write_all(&writer_payload).await.unwrap();
+        write_half.shutdown().await.unwrap();
+    });
+
+    let mut got = Vec::with_capacity(PAYLOAD_LEN);
+    let mut buf = vec![0u8; 65536];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while got.len() < payload.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, read_half.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    let _ = writer.await;
+
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "large payload stalled: delivered {} of {} bytes (send-buffer overflow regression)",
+        got.len(),
+        expected.len()
+    );
+    assert_eq!(got, expected, "large payload must round-trip intact");
 }

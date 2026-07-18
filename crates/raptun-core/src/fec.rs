@@ -978,7 +978,6 @@ mod tests {
     #[test]
     fn entirely_lost_block_recovered_via_high_water_when_idle() {
         use raptun_fec::link::{LinkState, LossRegime};
-        use raptun_fec::RepairBudget;
         use std::time::Duration;
 
         let mut sender = FecSender::new(1, SYM, K);

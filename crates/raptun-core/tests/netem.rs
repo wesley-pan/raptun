@@ -59,6 +59,9 @@ impl Rng {
 
 /// A datagram in flight on the (lossy) data channel, ordered by delivery time.
 struct InFlight {
+    // Retained for readability of the flight record even though ordering is
+    // handled by the priority queue rather than by reading this field back.
+    #[allow(dead_code)]
     deliver_at: u64, // virtual ms
     block: u64,
     esi: u32,
@@ -157,6 +160,7 @@ impl Metrics {
 
 /// Run one extreme-network scenario end to end and return (recovered bytes,
 /// original bytes, metrics).
+#[allow(clippy::too_many_arguments)]
 fn run_scenario(
     seed: u64,
     payload_len: usize,
@@ -193,7 +197,6 @@ fn run_scenario(
     let mut block_done: Vec<bool> = Vec::new();
     let mut now = 0u64;
     for chunk in payload.chunks(cap) {
-        let block_id = first_offered.len() as u64;
         for dg in sender.encode_one_block(chunk, proactive_repair) {
             let (h, p) = SymbolHeader::parse(&dg).unwrap();
             data.send(now, h.block_id, h.esi, p.to_vec(), &mut rng);
@@ -229,7 +232,7 @@ fn run_scenario(
     let clock_start = Instant::now(); // only for the tick's `now: Instant` arg base
     let deadline = 60_000u64; // 60 virtual seconds hard cap
 
-    while (receiver.highest_delivered() as u64) < total_blocks && now < deadline {
+    while receiver.highest_delivered() < total_blocks && now < deadline {
         // Deliver data-channel arrivals.
         for item in data.ready(now) {
             let out = receiver.on_symbol(

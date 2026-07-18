@@ -67,7 +67,7 @@ pub struct SymbolHeader {
 impl SymbolHeader {
     /// Split a received datagram into its header and the symbol payload that
     /// follows. Returns the payload as a sub-slice (no copy).
-    pub fn parse<'a>(mut datagram: &'a [u8]) -> Result<(Self, &'a [u8]), WireError> {
+    pub fn parse(mut datagram: &[u8]) -> Result<(Self, &[u8]), WireError> {
         let header = Self::decode(&mut datagram)?;
         // `decode` advanced the &[u8] cursor; whatever remains is the payload.
         Ok((header, datagram))
