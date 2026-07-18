@@ -132,8 +132,10 @@ mod tests {
 
     #[test]
     fn datagram_escape_hatch_disables_symbol_budget() {
-        let mut cfg = TransportConfig::default();
-        cfg.use_datagrams = false;
+        let cfg = TransportConfig {
+            use_datagrams: false,
+            ..TransportConfig::default()
+        };
         assert!(build_transport(&cfg).is_ok());
         assert_eq!(max_symbol_payload(&cfg), None);
     }

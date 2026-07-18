@@ -664,9 +664,7 @@ async fn tunnel_drains_when_downstream_finishes_before_upstream_eof() {
     // to 0 after rising). The trivial startup 0 (before the connection opens)
     // does not satisfy this because it precedes the rise.
     let rose = counts.iter().position(|&c| c >= 1);
-    let drained_after_rise = rose
-        .map(|i| counts[i..].iter().any(|&c| c == 0))
-        .unwrap_or(false);
+    let drained_after_rise = rose.map(|i| counts[i..].contains(&0)).unwrap_or(false);
     assert!(
         drained_after_rise,
         "tunnel must go active then drain to 0 after downstream finishes first; \

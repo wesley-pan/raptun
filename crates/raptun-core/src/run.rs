@@ -526,6 +526,11 @@ async fn server_tunnel_fec(
 ///   ([`FecReceiver::tick`]) over stalled blocks and emit NACKs.
 /// * **Signal reader/writer**: multiplex [`TunnelSignal`]s over the one reliable
 ///   bi-stream.
+// The parameters are the tunnel's collaborators (connection, negotiated FEC
+// params, shared budget, stream id, the TCP socket, and the three QUIC
+// channels); bundling them into a struct would only move the same fan-out one
+// level up without improving clarity.
+#[allow(clippy::too_many_arguments)]
 async fn run_fec_tunnel(
     conn: &quinn::Connection,
     fec: &FecParams,
