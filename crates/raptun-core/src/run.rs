@@ -486,6 +486,17 @@ async fn run_fec_tunnel(
     // Reliable-retransmit data routed to the downstream task (which owns the
     // receiver and delivers in order).
     let (rel_data_tx, mut rel_data_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+    // Downstream-finished signal: fires exactly once when the `down` task
+    // completes (either the peer's announced block count has been fully
+    // delivered, or the inbound datagram channel closed). `up`'s post-EOF
+    // service loop observes this and exits promptly, which drops both local
+    // `sig_tx` clones, lets `writer` call `sig_send.finish()`, and cascades
+    // an EOF to the peer's `reader` so the peer's identical loop also
+    // unwinds. Without this, both ends deadlock waiting on each other and
+    // `ActiveGuard` is never dropped (the `active_tunnels` leak).
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let up_shutdown = shutdown.clone();
+    let down_shutdown = shutdown.clone();
 
     // --- Signal writer: owns sig_send, serializes queued signals. ---
     let writer = async move {
@@ -607,6 +618,10 @@ async fn run_fec_tunnel(
                         let _ = up_sig.send(TunnelSignal::ReliableData { block, bytes });
                     }
                 }
+                // Downstream finished: stop serving late repairs and unwind so
+                // the sig_tx clones drop, writer.finish() cascades EOF to the
+                // peer, and `ActiveGuard` can drop (fixes active_tunnels leak).
+                _ = up_shutdown.notified() => break,
                 else => break,
             }
         }
@@ -682,6 +697,7 @@ async fn run_fec_tunnel(
             }
         }
         let _ = tcp_write.shutdown().await;
+        down_shutdown.notify_waiters();
         Ok::<(), CoreError>(())
     };
 
