@@ -139,6 +139,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 10)]
     pub keepalive: u64,
 
+    /// Interval in seconds for the periodic connection-status heartbeat log
+    /// (RTT/cwnd/loss/active tunnels); 0 disables. A healthy tunnel is otherwise
+    /// silent after startup, so this confirms liveness at the default log level.
+    #[arg(long, default_value_t = 30)]
+    pub heartbeat: u64,
+
     /// Idle timeout in seconds before an idle connection is dropped.
     #[arg(long, default_value_t = 30)]
     pub idle_timeout: u64,
@@ -221,6 +227,7 @@ impl Cli {
             allow_migration: self.migration,
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,
+            heartbeat: (self.heartbeat > 0).then(|| Duration::from_secs(self.heartbeat)),
         };
 
         RuntimeConfig {

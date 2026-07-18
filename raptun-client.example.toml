@@ -36,6 +36,7 @@ conn_rwnd     = 16777216                    # 16 MiB
 sockbuf       = 4194304                     # 4 MiB
 keepalive     = 10                          # seconds; 0 disables
 idle_timeout  = 30
+heartbeat     = 30                          # seconds; periodic "tunnel alive" log at info level, 0 disables
 migration     = true
 zero_rtt      = true
 dscp          = 0

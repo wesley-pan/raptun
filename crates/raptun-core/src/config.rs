@@ -98,6 +98,11 @@ pub struct TransportConfig {
     pub allow_migration: bool,
     pub allow_0rtt: bool,
     pub dscp: u8,
+    /// Interval for the client's periodic connection-status heartbeat log
+    /// (RTT / cwnd / loss / active tunnels), or `None` to disable it. This is a
+    /// liveness signal at `info` level: a healthy tunnel is otherwise silent
+    /// after startup, so operators see no rolling output confirming it works.
+    pub heartbeat: Option<Duration>,
 }
 
 impl Default for TransportConfig {
@@ -114,6 +119,7 @@ impl Default for TransportConfig {
             allow_migration: true,
             allow_0rtt: true,
             dscp: 0,
+            heartbeat: Some(Duration::from_secs(30)),
         }
     }
 }

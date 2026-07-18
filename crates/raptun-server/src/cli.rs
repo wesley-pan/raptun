@@ -193,6 +193,9 @@ impl Cli {
             allow_migration: self.migration,
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,
+            // The heartbeat log is a client-side liveness aid; the server does
+            // not emit it.
+            heartbeat: None,
         };
 
         RuntimeConfig {

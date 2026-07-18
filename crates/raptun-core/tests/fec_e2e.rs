@@ -485,3 +485,101 @@ async fn reliable_retransmit_completes_under_unrecoverable_loss() {
         "reliable-retransmit fallback must complete the stream when FEC cannot"
     );
 }
+
+/// A `MakeWriter` that appends every log line into a shared buffer, so a test
+/// can assert on emitted `tracing` output.
+#[derive(Clone)]
+struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+    type Writer = BufWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The client's periodic heartbeat must emit a rolling `info` line while the
+/// tunnel is healthy — the fix for "logs stop scrolling after startup". We set
+/// a sub-second heartbeat, capture `info` output, and assert the "tunnel alive"
+/// line appears more than once (i.e. it recurs, not just a one-off startup log).
+///
+/// Runs on a single-threaded runtime so all spawned tasks share this thread's
+/// thread-local `tracing` subscriber (a multi-thread runtime would run the
+/// heartbeat task on a worker thread that never sees the captured subscriber).
+#[tokio::test(flavor = "current_thread")]
+async fn client_emits_periodic_heartbeat() {
+    let _guard = E2E_LOCK.lock().await;
+
+    // Capture info-level logs into a shared buffer for the duration of the test.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("raptun_core=info")
+        .with_writer(BufWriter(buf.clone()))
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+
+    // Reliable-stream path keeps the test simple; a short heartbeat so several
+    // ticks land within the test window.
+    let mut cfg = fec_config();
+    cfg.fec.scheme = FecScheme::Off;
+    cfg.transport.use_datagrams = false;
+    cfg.transport.heartbeat = Some(Duration::from_millis(300));
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_addr = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+            .unwrap();
+        ep.local_addr().unwrap()
+    };
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let local_addr = {
+        let l = TcpListener::bind(local_bind).await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+
+    // Let several heartbeat intervals elapse (first tick is skipped, so wait for
+    // at least two more).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let beats = logs.matches("tunnel alive").count();
+    assert!(
+        beats >= 2,
+        "heartbeat must recur (rolling output); saw {beats} in logs:\n{logs}"
+    );
+}
