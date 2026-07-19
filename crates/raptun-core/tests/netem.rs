@@ -250,6 +250,17 @@ fn run_scenario(
                 &receiver,
             );
             assembled.extend_from_slice(&out);
+            // A block may have decoded: ack it so the sender releases
+            // its retained state for this block.
+            for block in receiver.drain_acks() {
+                sig.send(
+                    now,
+                    block,
+                    0,
+                    TunnelSignal::BlockAck { block }.encode(),
+                    &mut rng,
+                );
+            }
         }
         // Deliver signaling-channel arrivals (both directions share `sig`).
         for item in sig.ready(now) {
@@ -293,10 +304,25 @@ fn run_scenario(
                             &receiver,
                         );
                         assembled.extend_from_slice(&out);
+                        // A reliably-completed block is also done: ack it.
+                        for block in receiver.drain_acks() {
+                            sig.send(
+                                now,
+                                block,
+                                0,
+                                TunnelSignal::BlockAck { block }.encode(),
+                                &mut rng,
+                            );
+                        }
                     }
                     // Flow-control credit is a live-path optimization; the
                     // deterministic netem model does not gate on it.
                     TunnelSignal::Credit { .. } => {}
+                    // BlockAck: the receiver decoded this block; release
+                    // the sender's retained state for it.
+                    TunnelSignal::BlockAck { block } => {
+                        sender.retire_block(block);
+                    }
                 }
             }
         }
@@ -319,6 +345,17 @@ fn run_scenario(
             }
             for s in signals {
                 sig.send(now, 0, 0, s.encode(), &mut rng);
+            }
+            // Tick may have detected entirely-lost blocks and completed
+            // them via the reliable path; ack those too.
+            for block in receiver.drain_acks() {
+                sig.send(
+                    now,
+                    block,
+                    0,
+                    TunnelSignal::BlockAck { block }.encode(),
+                    &mut rng,
+                );
             }
         }
 

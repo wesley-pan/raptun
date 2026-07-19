@@ -22,6 +22,11 @@ use raptun_fec::link::{LinkState, LossRegime};
 #[derive(Debug, Default)]
 pub struct LossTracker {
     prev: Option<(u64, u64)>, // (sent, lost) at the previous sample
+    /// Wall-clock time the loss-source diagnostic was last emitted. Throttles
+    /// the log added to `read_telemetry`: that fn is called from a 20ms
+    /// downstream tick *and* a 1s heartbeat, so a sustained high-loss run
+    /// would flood the log without a per-tracker rate limit.
+    last_diag: Option<std::time::Instant>,
 }
 
 impl LossTracker {
@@ -48,6 +53,21 @@ impl LossTracker {
         };
         self.prev = Some((sent, lost));
         rate
+    }
+
+    /// Return `true` at most once per `DIAG_INTERVAL` so the loss-source
+    /// diagnostic in `read_telemetry` doesn't fire on every 20ms tick. Returns
+    /// `true` (and stamps the clock) when enough time has elapsed.
+    pub(crate) fn allow_diag(&mut self) -> bool {
+        const DIAG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let now = std::time::Instant::now();
+        match self.last_diag {
+            Some(t) if now.duration_since(t) < DIAG_INTERVAL => false,
+            _ => {
+                self.last_diag = Some(now);
+                true
+            }
+        }
     }
 }
 

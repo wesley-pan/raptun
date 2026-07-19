@@ -78,6 +78,15 @@ pub enum TunnelSignal {
     /// cannot outrun the link and self-inflict congestion loss. Modelled on
     /// smux's `cmdUPD` (consumed/window) credit, but block-denominated.
     Credit { delivered: u64 },
+    /// Receiver -> sender: block `block` has been decoded successfully, so its
+    /// symbols are no longer needed. The sender may release the retained
+    /// encoder/payload for this block immediately. Unlike `Credit` (which
+    /// advances only with in-order delivery), `BlockAck` fires per-block on
+    /// decode, so a block that decoded out of order still frees its sender
+    /// state without waiting for the delivery floor to reach it. This is the
+    /// "decoded -> ack -> release" signal that keeps sender memory bounded by
+    /// in-flight blocks rather than by the byte retention window.
+    BlockAck { block: BlockId },
 }
 
 impl TunnelSignal {
@@ -87,6 +96,7 @@ impl TunnelSignal {
     const TAG_RELIABLE_DATA: u8 = 4;
     const TAG_HIGH_WATER: u8 = 5;
     const TAG_CREDIT: u8 = 6;
+    const TAG_BLOCKACK: u8 = 7;
 
     /// Upper bound on a `ReliableData` payload we will accept, to cap the
     /// allocation a peer can force. One block is at most `K * symbol_size`;
@@ -124,6 +134,10 @@ impl TunnelSignal {
             TunnelSignal::Credit { delivered } => {
                 b.push(Self::TAG_CREDIT);
                 b.extend_from_slice(&delivered.to_be_bytes());
+            }
+            TunnelSignal::BlockAck { block } => {
+                b.push(Self::TAG_BLOCKACK);
+                b.extend_from_slice(&block.to_be_bytes());
             }
         }
         b
@@ -187,6 +201,13 @@ impl TunnelSignal {
                 }
                 let delivered = u64::from_be_bytes(buf[1..9].try_into().unwrap());
                 Some((TunnelSignal::Credit { delivered }, 9))
+            }
+            Self::TAG_BLOCKACK => {
+                if buf.len() < 1 + 8 {
+                    return None;
+                }
+                let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Some((TunnelSignal::BlockAck { block }, 9))
             }
             // Unknown tag: consume one byte to resync rather than deadlock.
             _ => Some((TunnelSignal::BlockCount { total: u64::MAX }, 1)),
@@ -465,6 +486,11 @@ pub struct FecReceiver {
     /// control tick does not re-request them every cycle while the reliable data
     /// is in flight.
     reliable_requested: std::collections::HashSet<BlockId>,
+    /// Blocks decoded since the last `drain_acks` - queued for a `BlockAck`
+    /// signal to the sender so it can release their retained state. A block is
+    /// pushed the moment it decodes (enters `ready`), not when it is delivered
+    /// in order, so an out-of-order decode still frees sender memory promptly.
+    pending_acks: Vec<BlockId>,
 }
 
 impl FecReceiver {
@@ -479,6 +505,7 @@ impl FecReceiver {
             total_blocks: None,
             high_water: 0,
             reliable_requested: std::collections::HashSet::new(),
+            pending_acks: Vec::new(),
         }
     }
 
@@ -529,6 +556,10 @@ impl FecReceiver {
         {
             self.managers.remove(&block_id);
             self.ready.insert(block_id, bytes);
+            // Queue a BlockAck: the block decoded, so the sender can release
+            // its encoder/payload for this block now (not when it is delivered
+            // in order).
+            self.pending_acks.push(block_id);
         }
 
         self.drain_ready()
@@ -555,6 +586,14 @@ impl FecReceiver {
     /// oracle (`later_blocks_progressing`).
     pub fn highest_delivered(&self) -> BlockId {
         self.next_deliver
+    }
+
+    /// Take the blocks decoded since the last call, to be acknowledged to the
+    /// sender via [`TunnelSignal::BlockAck`]. Each decoded block appears once;
+    /// the caller drains and sends after each `on_symbol` / `on_reliable_block`
+    /// burst and/or on the control tick.
+    pub fn drain_acks(&mut self) -> Vec<BlockId> {
+        std::mem::take(&mut self.pending_acks)
     }
 
     /// Iterate the block ids with live (undecoded) managers, for control-tick
@@ -685,6 +724,9 @@ impl FecReceiver {
         self.managers.remove(&block_id);
         self.reliable_requested.remove(&block_id);
         self.ready.insert(block_id, bytes);
+        // A reliably-completed block is also done with the sender's retained
+        // state, so ack it just like a decoded one.
+        self.pending_acks.push(block_id);
         self.drain_ready()
     }
 }

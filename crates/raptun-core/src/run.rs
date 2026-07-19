@@ -657,6 +657,12 @@ async fn run_fec_tunnel(
     // the peer's cumulative delivered-block high-water. `up` gates production so
     // in-flight blocks stay bounded (see `CREDIT_WINDOW_BLOCKS`).
     let (credit_tx, mut credit_rx) = mpsc::unbounded_channel::<u64>();
+    // Block-level decode acknowledgements routed from the signal reader to the
+    // upstream task: each block the receiver decoded is released on the sender
+    // side via `FecSender::retire_block`. Distinct from `credit_rx` (which
+    // drives flow control on in-order delivery): a BlockAck fires per-block on
+    // decode, so out-of-order decodes still free sender memory promptly.
+    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
     // Downstream-finished signal: fires exactly once when the `down` task
     // completes (either the peer's announced block count has been fully
     // delivered, or the inbound datagram channel closed). `up`'s post-EOF
@@ -725,6 +731,9 @@ async fn run_fec_tunnel(
                     }
                     TunnelSignal::Credit { delivered } => {
                         let _ = credit_tx.send(delivered);
+                    }
+                    TunnelSignal::BlockAck { block } => {
+                        let _ = ack_tx.send(block);
                     }
                 }
             }
@@ -837,6 +846,12 @@ async fn run_fec_tunnel(
                     up_window.settle(newly);
                     credit_fresh = true;
                 }
+                // A block was decoded on the receiver: release its retained
+                // encoder/payload now rather than waiting for the byte
+                // retention window to evict it.
+                Some(block) = ack_rx.recv() => {
+                    sender.retire_block(block);
+                }
             }
         }
         // Announce the count so the receiver knows the stream length, then keep
@@ -857,6 +872,12 @@ async fn run_fec_tunnel(
                     if let Some(bytes) = sender.reliable_payload(block) {
                         let _ = up_sig.send(TunnelSignal::ReliableData { block, bytes });
                     }
+                }
+                // Late BlockAck: the receiver may still be decoding the last
+                // blocks after we've announced BlockCount; retire them so the
+                // sender's retained state is cleaned up.
+                Some(block) = ack_rx.recv() => {
+                    sender.retire_block(block);
                 }
                 // Downstream finished: stop serving late repairs and unwind so
                 // the sig_tx clones drop, writer.finish() cascades EOF to the
@@ -907,6 +928,12 @@ async fn run_fec_tunnel(
                             if !out.is_empty() {
                                 tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
                             }
+                            // A block may have decoded from this symbol:
+                            // ack it immediately so the sender can release
+                            // its retained encoder/payload.
+                            for block in receiver.drain_acks() {
+                                let _ = down_sig.send(TunnelSignal::BlockAck { block });
+                            }
                         }
                         None => break,
                     }
@@ -931,6 +958,11 @@ async fn run_fec_tunnel(
                     if !out.is_empty() {
                         tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
                     }
+                    // A reliably-completed block is also done: ack it
+                    // so the sender releases its state.
+                    for block in receiver.drain_acks() {
+                        let _ = down_sig.send(TunnelSignal::BlockAck { block });
+                    }
                 }
                 _ = ticker.tick() => {
                     // Refresh telemetry-derived link state + budget ceiling, then
@@ -943,6 +975,11 @@ async fn run_fec_tunnel(
                     down_window.refresh_ceiling(link.cwnd_bytes());
                     for sig in receiver.tick(&link, &budget, Instant::now()) {
                         let _ = down_sig.send(sig);
+                    }
+                    // Tick may have detected entirely-lost blocks and
+                    // completed them via the reliable path; ack those too.
+                    for block in receiver.drain_acks() {
+                        let _ = down_sig.send(TunnelSignal::BlockAck { block });
                     }
                     // Emit a flow-control credit: the sender caps in-flight blocks
                     // at delivered + window. Sent every tick (not only on change)

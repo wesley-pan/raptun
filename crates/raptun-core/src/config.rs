@@ -115,6 +115,31 @@ pub struct TransportConfig {
     pub allow_migration: bool,
     pub allow_0rtt: bool,
     pub dscp: u8,
+    /// QUIC packet-reordering threshold for loss detection (Quinn
+    /// `packet_threshold`). Raised from Quinn's default of 3 so that a shaped
+    /// link spreading adjacent packets across a wide delay window (e.g. the
+    /// stress relay's per-packet jitter) does not misclassify late-but-arriving
+    /// packets as lost - the misclassification triggers black-hole detection
+    /// and cwnd collapse, which is the root cause of the spurious high loss_pct
+    /// and throughput collapse observed under reordering. Higher = slower
+    /// real-loss detection; 8 is a measured balance for ~100 ms jitter links.
+    pub reorder_packet_threshold: u32,
+    /// Fraction-of-RTT time-based loss threshold (Quinn `time_threshold`).
+    /// Raised from 1.125 to 2.0 so a packet delayed beyond ~1 RTT is not
+    /// declared lost - same rationale as `reorder_packet_threshold`.
+    pub reorder_time_threshold: f32,
+    /// Persistent-congestion threshold (Quinn
+    /// `persistent_congestion_threshold`). Raised from 3 to 5 to avoid
+    /// declaring persistent congestion (which slashes the cwnd to the floor)
+    /// during a burst of reordering-induced spurious loss.
+    pub persistent_congestion_threshold: u32,
+    /// Floor on the path MTU (Quinn `min_mtu`); guards against MTU black-hole
+    /// detection forcing the cwnd to minimum on a link that simply reorders.
+    pub min_mtu: u16,
+    /// Override Quinn's initial RTT estimate. `None` keeps Quinn's default;
+    /// `Some(d)` raises the initial grace window on high-latency links where
+    /// the default 33 ms makes early loss detection too aggressive.
+    pub initial_rtt: Option<Duration>,
     /// Interval for the client's periodic connection-status heartbeat log
     /// (RTT / cwnd / loss / active tunnels), or `None` to disable it. This is a
     /// liveness signal at `info` level: a healthy tunnel is otherwise silent
@@ -138,6 +163,11 @@ impl Default for TransportConfig {
             allow_migration: true,
             allow_0rtt: true,
             dscp: 0,
+            reorder_packet_threshold: 8,
+            reorder_time_threshold: 2.0,
+            persistent_congestion_threshold: 5,
+            min_mtu: 1200,
+            initial_rtt: None,
             heartbeat: Some(Duration::from_secs(30)),
         }
     }
