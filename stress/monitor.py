@@ -23,6 +23,10 @@ ALIVE_RE = re.compile(
     r'loss_pct="([\d.]+)".*?active_tunnels=(\d+)'
 )
 
+# raptun logs may carry ANSI colour codes (tracing's default when the writer
+# looks like a terminal), which break the field regex; strip them first.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def parse_cputime(s: str) -> float:
     """Parse ps TIME like 'MM:SS.ss' or 'HH:MM:SS' into seconds."""
@@ -95,7 +99,7 @@ def main():
 
         # Drain new telemetry lines.
         for line in logf:
-            m = ALIVE_RE.search(line)
+            m = ALIVE_RE.search(ANSI_RE.sub("", line))
             if m:
                 met_f.write(
                     f"{ts:.1f},{m.group(1)},{m.group(2)},{m.group(3)},{m.group(4)}\n"
