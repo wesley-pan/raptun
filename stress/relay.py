@@ -138,7 +138,20 @@ async def main():
         f"delay={delay_ms}ms jitter={jitter_ms}ms loss={loss_pct}%",
         flush=True,
     )
-    await asyncio.Event().wait()
+    # Periodically report actual shaped counts so the run can compare the loss
+    # the relay INJECTED against the loss the client's telemetry REPORTS.
+    while True:
+        await asyncio.sleep(5)
+        s = relay.stats
+        up_tot = s["c2s"] + s["drop_up"]
+        down_tot = s["s2c"] + s["drop_down"]
+        up_loss = 100.0 * s["drop_up"] / max(1, up_tot)
+        down_loss = 100.0 * s["drop_down"] / max(1, down_tot)
+        print(
+            f"relay stats: c2s={s['c2s']} (drop {s['drop_up']}, {up_loss:.1f}%) "
+            f"s2c={s['s2c']} (drop {s['drop_down']}, {down_loss:.1f}%)",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
