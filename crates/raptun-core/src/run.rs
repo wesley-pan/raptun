@@ -141,6 +141,9 @@ async fn serve_connection(
     // the aggregate repair injection overshoots the link by a factor of N —
     // self-inflicted congestion that collapses throughput as concurrency rises.
     let budget = new_conn_budget(&conn, &fec, config);
+    // One connection-wide send window, shared by every tunnel so aggregate
+    // in-flight data stays bounded by cwnd regardless of tunnel count.
+    let send_window = new_conn_send_window(&conn, &fec);
 
     // Count of currently-live tunnels, surfaced by the heartbeat. Each accepted
     // connection increments it and a guard decrements on completion.
@@ -166,13 +169,14 @@ async fn serve_connection(
         let fec = fec.clone();
         let active = Arc::clone(&active);
         let budget = Arc::clone(&budget);
+        let send_window = Arc::clone(&send_window);
         tokio::spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
             active.fetch_add(1, Ordering::Relaxed);
             let _guard = ActiveGuard(&active);
             let res = if use_fec {
-                handle_client_conn_fec(&conn, &hub, &fec, &budget, tcp).await
+                handle_client_conn_fec(&conn, &hub, &fec, &budget, &send_window, tcp).await
             } else {
                 handle_client_conn(&conn, tcp).await
             };
@@ -266,13 +270,14 @@ async fn handle_client_conn_fec(
     hub: &DatagramHub,
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
+    send_window: &Arc<raptun_fec::SendWindow>,
     tcp: TcpStream,
 ) -> Result<()> {
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| CoreError::Endpoint(format!("open signaling bi: {e}")))?;
-    client_tunnel_fec(conn, hub, fec, budget, tcp, send, recv).await
+    client_tunnel_fec(conn, hub, fec, budget, send_window, tcp, send, recv).await
 }
 
 /// Run the server: listen for QUIC connections, run the handshake on each, and
@@ -338,6 +343,7 @@ async fn handle_server_conn(
     // ≤40%-of-cwnd brake operates over the whole connection, not per tunnel (see
     // the matching comment in `serve_connection`).
     let budget = new_conn_budget(&conn, &fec, &config);
+    let send_window = new_conn_send_window(&conn, &fec);
 
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
@@ -351,6 +357,7 @@ async fn handle_server_conn(
         let hub = hub.clone();
         let fec = fec.clone();
         let budget = Arc::clone(&budget);
+        let send_window = Arc::clone(&send_window);
         tokio::spawn(async move {
             // Bound the target connect: an unreachable target must not park this
             // tunnel on the OS default timeout while its QUIC stream stays open.
@@ -358,7 +365,8 @@ async fn handle_server_conn(
             match connect {
                 Ok(Ok(tcp)) => {
                     let res = if use_fec {
-                        server_tunnel_fec(&conn, &hub, &fec, &budget, tcp, send, recv).await
+                        server_tunnel_fec(&conn, &hub, &fec, &budget, &send_window, tcp, send, recv)
+                            .await
                     } else {
                         tunnel_bi(tcp, send, recv).await
                     };
@@ -417,6 +425,21 @@ fn new_conn_budget(
     ))
 }
 
+/// One connection-wide [`SendWindow`], shared by every tunnel on the QUIC
+/// connection so aggregate in-flight data blocks stay bounded by cwnd (not
+/// multiplied by the tunnel count).
+fn new_conn_send_window(conn: &quinn::Connection, fec: &FecParams) -> Arc<raptun_fec::SendWindow> {
+    let symbol_size = effective_symbol_size(conn, fec.symbol_size);
+    let k = resolve_k(fec).max(1) as u64;
+    let block_bytes = symbol_size as u64 * k;
+    // Floor: even on a cold/tiny cwnd, allow a little in-flight per connection so
+    // startup isn't throttled to a crawl.
+    Arc::new(raptun_fec::SendWindow::new(
+        block_bytes,
+        CREDIT_WINDOW_FLOOR_BLOCKS,
+    ))
+}
+
 /// Test-only counter of how many per-connection repair budgets have been
 /// created. The invariant is *one budget per QUIC connection* — a regression
 /// that moves budget creation back inside the per-tunnel path would make this
@@ -462,6 +485,21 @@ fn repair_count(fec: &FecParams, k: u32) -> u32 {
 /// tunnels keeps them from colliding with any future server-originated ones.
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(2);
 
+/// Floor for the connection-wide [`raptun_fec::SendWindow`], in blocks: even on
+/// a cold or tiny congestion window, the connection may keep this many data
+/// blocks in flight so startup and thin links aren't throttled to a crawl. The
+/// real ceiling is cwnd-derived and usually far larger; this only bounds the
+/// low end. At the default geometry (~18 KB/block) 16 blocks ≈ 300 KB.
+const CREDIT_WINDOW_FLOOR_BLOCKS: u64 = 16;
+
+/// If no fresh credit arrives for this long while the window is full, the
+/// sender stops gating and falls back to cwnd back-pressure (see the gate in
+/// `run_fec_tunnel`). This guarantees a delayed or lost credit can only degrade
+/// the sender to its pre-credit behaviour, never deadlock it. The reliable
+/// signaling stream already guarantees eventual credit delivery; this is a
+/// further backstop for pathological credit delay.
+const CREDIT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Spawn the connection-wide datagram read loop that feeds the hub.
 fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
     tokio::spawn(async move {
@@ -482,11 +520,13 @@ fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
 
 /// Client side of a FEC tunnel: assign a stream id, announce it on the
 /// bi-stream, then pump TCP data both ways over FEC datagrams.
+#[allow(clippy::too_many_arguments)]
 async fn client_tunnel_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
+    send_window: &Arc<raptun_fec::SendWindow>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
@@ -501,7 +541,15 @@ async fn client_tunnel_fec(
     let inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "client FEC tunnel opened");
     let res = run_fec_tunnel(
-        conn, fec, budget, stream_id, tcp, sig_send, sig_recv, inbound,
+        conn,
+        fec,
+        budget,
+        send_window,
+        stream_id,
+        tcp,
+        sig_send,
+        sig_recv,
+        inbound,
     )
     .await;
     hub.unregister(stream_id);
@@ -510,11 +558,13 @@ async fn client_tunnel_fec(
 
 /// Server side of a FEC tunnel: read the client's stream id off the bi-stream,
 /// register the route, then pump TCP data both ways.
+#[allow(clippy::too_many_arguments)]
 async fn server_tunnel_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
+    send_window: &Arc<raptun_fec::SendWindow>,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
@@ -529,7 +579,15 @@ async fn server_tunnel_fec(
     let inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "server FEC tunnel opened");
     let res = run_fec_tunnel(
-        conn, fec, budget, stream_id, tcp, sig_send, sig_recv, inbound,
+        conn,
+        fec,
+        budget,
+        send_window,
+        stream_id,
+        tcp,
+        sig_send,
+        sig_recv,
+        inbound,
     )
     .await;
     hub.unregister(stream_id);
@@ -561,6 +619,7 @@ async fn run_fec_tunnel(
     conn: &quinn::Connection,
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
+    send_window: &Arc<raptun_fec::SendWindow>,
     stream_id: StreamId,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
@@ -594,6 +653,10 @@ async fn run_fec_tunnel(
     // Reliable-retransmit data routed to the downstream task (which owns the
     // receiver and delivers in order).
     let (rel_data_tx, mut rel_data_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+    // Flow-control credit routed from the signal reader to the upstream task:
+    // the peer's cumulative delivered-block high-water. `up` gates production so
+    // in-flight blocks stay bounded (see `CREDIT_WINDOW_BLOCKS`).
+    let (credit_tx, mut credit_rx) = mpsc::unbounded_channel::<u64>();
     // Downstream-finished signal: fires exactly once when the `down` task
     // completes (either the peer's announced block count has been fully
     // delivered, or the inbound datagram channel closed). `up`'s post-EOF
@@ -660,6 +723,9 @@ async fn run_fec_tunnel(
                     TunnelSignal::ReliableData { block, bytes } => {
                         let _ = rel_data_tx.send((block, bytes));
                     }
+                    TunnelSignal::Credit { delivered } => {
+                        let _ = credit_tx.send(delivered);
+                    }
                 }
             }
         };
@@ -670,12 +736,21 @@ async fn run_fec_tunnel(
     //     reliable-retransmit requests. ---
     let up_conn = conn.clone();
     let up_sig = sig_tx.clone();
+    let up_window = Arc::clone(send_window);
     let up = async move {
         let mut down_done_rx = down_done_rx;
         let mut sender = FecSender::new(stream_id, symbol_size, k);
         let cap = sender.block_payload();
         let mut buf = vec![0u8; cap];
         let mut total_blocks: u64 = 0;
+        // Peer's delivered-block high-water for THIS tunnel, from `Credit`
+        // signals. Used to reconcile this tunnel's contribution to the shared
+        // connection-wide send window as blocks are delivered.
+        let mut delivered: u64 = 0;
+        // Whether credits are flowing recently enough to gate on. Cleared when a
+        // probe times out (fall back to cwnd back-pressure), re-armed when a
+        // fresh credit arrives.
+        let mut credit_fresh: bool = true;
         let mut eof = false;
 
         while !eof {
@@ -691,6 +766,42 @@ async fn run_fec_tunnel(
                     // buffering until a full block forms would stall interactive
                     // traffic whose messages are far smaller than a block.
                     for chunk in buf[..n].chunks(cap) {
+                        // Flow-control gate against the CONNECTION-WIDE window
+                        // (shared by all tunnels, cwnd-derived) so aggregate
+                        // in-flight blocks can't overshoot the link no matter how
+                        // many tunnels are active. Block while the window is full
+                        // and credits are flowing; if none arrives within the
+                        // probe timeout, treat credits as stale and stop gating,
+                        // falling back to send-buffer + cwnd back-pressure. A
+                        // later credit re-arms the gate. So a delayed/lost credit
+                        // can only degrade to the pre-credit behaviour, never
+                        // deadlock. TCP reads pausing here IS the back-pressure.
+                        while credit_fresh && !up_window.has_room() {
+                            let probe = tokio::time::sleep(CREDIT_PROBE_TIMEOUT);
+                            tokio::select! {
+                                c = credit_rx.recv() => {
+                                    match c {
+                                        Some(d) => {
+                                            let newly = d.saturating_sub(delivered);
+                                            delivered = delivered.max(d);
+                                            up_window.settle(newly);
+                                            credit_fresh = true;
+                                        }
+                                        None => break, // credit channel closed; stop gating
+                                    }
+                                }
+                                _ = probe => {
+                                    credit_fresh = false;
+                                    tracing::debug!(
+                                        in_flight = up_window.in_flight(),
+                                        ceiling = up_window.ceiling(),
+                                        "credit stale: gating disabled, relying on cwnd back-pressure"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        up_window.add_sent();
                         for dg in sender.encode_one_block(chunk, repair) {
                             send_datagram_paced(&up_conn, dg).await;
                         }
@@ -717,6 +828,14 @@ async fn run_fec_tunnel(
                     if let Some(bytes) = sender.reliable_payload(block) {
                         let _ = up_sig.send(TunnelSignal::ReliableData { block, bytes });
                     }
+                }
+                // Drain flow-control credits even when not gating, so the shared
+                // window is reconciled and a stale gate re-arms as credits resume.
+                Some(d) = credit_rx.recv() => {
+                    let newly = d.saturating_sub(delivered);
+                    delivered = delivered.max(d);
+                    up_window.settle(newly);
+                    credit_fresh = true;
                 }
             }
         }
@@ -758,6 +877,7 @@ async fn run_fec_tunnel(
     // atomic in-flight counter and ceiling, so the ≤40%-of-cwnd cap applies to
     // the aggregate repair across all tunnels rather than per tunnel.
     let budget = Arc::clone(budget);
+    let down_window = Arc::clone(send_window);
     let down_conn = conn.clone();
     let down_sig = sig_tx.clone();
     let mut classifier = crate::telemetry::RegimeClassifier::new();
@@ -766,6 +886,9 @@ async fn run_fec_tunnel(
         let mut inbound = inbound;
         let mut receiver = FecReceiver::new(symbol_size, k);
         let mut expected: Option<u64> = None;
+        // Last delivered high-water announced to the peer as a flow-control
+        // credit, to avoid re-sending an unchanged value every tick.
+        let mut last_credit_sent: u64 = 0;
         // Tick cadence for the convergence arbitration.
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -815,8 +938,26 @@ async fn run_fec_tunnel(
                     let sample = crate::session::read_telemetry(&down_conn, &mut loss_tracker);
                     let link = classifier.to_link_state(sample);
                     budget.refresh_ceiling(link.cwnd_bytes());
+                    // Keep the connection-wide send window sized to the live cwnd
+                    // so the sender's flow-control gate tracks link capacity.
+                    down_window.refresh_ceiling(link.cwnd_bytes());
                     for sig in receiver.tick(&link, &budget, Instant::now()) {
                         let _ = down_sig.send(sig);
+                    }
+                    // Emit a flow-control credit: the sender caps in-flight blocks
+                    // at delivered + window. Sent every tick (not only on change)
+                    // so a delayed/lost earlier credit self-heals and the sender
+                    // is never stranded waiting for one — the reliable signaling
+                    // stream guarantees eventual delivery, and the sender also has
+                    // its own timeout-probe as a further backstop.
+                    let delivered = receiver.highest_delivered();
+                    // Only send on change. If the impairment hook drops it,
+                    // leave last_credit_sent unchanged so the credit is genuinely
+                    // lost for this value — the sender must then fall back on its
+                    // probe timeout, which is what the hook exercises.
+                    if delivered != last_credit_sent && !test_should_drop_credit() {
+                        let _ = down_sig.send(TunnelSignal::Credit { delivered });
+                        last_credit_sent = delivered;
                     }
                 }
             }
@@ -878,6 +1019,44 @@ static TEST_DROP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn set_test_drop_one_in(n: u64) {
     TEST_DROP_ONE_IN.store(n, Ordering::Relaxed);
     TEST_DROP_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Test-only flow-control credit impairment, to exercise the sender's behaviour
+/// when the reverse credit signal is delayed or lost. `1` fully suppresses
+/// credits (the extreme: the sender must rely entirely on its probe-timeout
+/// backstop to avoid deadlock); `n > 1` drops every `n`-th credit (partial
+/// delay). `0` (default) sends every credit normally.
+#[cfg(feature = "test-hooks")]
+static TEST_CREDIT_DROP_ONE_IN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-hooks")]
+static TEST_CREDIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Set credit-signal impairment: `1` suppresses all credits, `n>1` drops every
+/// `n`-th, `0` disables. See [`TEST_CREDIT_DROP_ONE_IN`].
+#[cfg(feature = "test-hooks")]
+pub fn set_test_credit_drop_one_in(n: u64) {
+    TEST_CREDIT_DROP_ONE_IN.store(n, Ordering::Relaxed);
+    TEST_CREDIT_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Whether this credit send should be suppressed by the test hook.
+#[cfg(feature = "test-hooks")]
+fn test_should_drop_credit() -> bool {
+    let n = TEST_CREDIT_DROP_ONE_IN.load(Ordering::Relaxed);
+    if n == 0 {
+        return false;
+    }
+    if n == 1 {
+        return true; // suppress all
+    }
+    let c = TEST_CREDIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    c % n == 0
+}
+
+#[cfg(not(feature = "test-hooks"))]
+#[inline]
+fn test_should_drop_credit() -> bool {
+    false
 }
 
 /// Hand a datagram to the transport, applying back-pressure instead of losing

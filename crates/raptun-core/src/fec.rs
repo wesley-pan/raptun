@@ -71,6 +71,13 @@ pub enum TunnelSignal {
     /// Sender → receiver: the reliable copy of `block`'s original payload bytes.
     /// Injected directly into the receiver's reorder buffer, bypassing RaptorQ.
     ReliableData { block: BlockId, bytes: Vec<u8> },
+    /// Receiver → sender: `delivered` is the number of blocks handed to the
+    /// local TCP so far (the receiver's cumulative delivery high-water). The
+    /// sender uses it as a flow-control credit — it may keep at most a bounded
+    /// number of blocks in flight beyond what the peer has delivered, so it
+    /// cannot outrun the link and self-inflict congestion loss. Modelled on
+    /// smux's `cmdUPD` (consumed/window) credit, but block-denominated.
+    Credit { delivered: u64 },
 }
 
 impl TunnelSignal {
@@ -79,6 +86,7 @@ impl TunnelSignal {
     const TAG_RELIABLE_REQUEST: u8 = 3;
     const TAG_RELIABLE_DATA: u8 = 4;
     const TAG_HIGH_WATER: u8 = 5;
+    const TAG_CREDIT: u8 = 6;
 
     /// Upper bound on a `ReliableData` payload we will accept, to cap the
     /// allocation a peer can force. One block is at most `K * symbol_size`;
@@ -112,6 +120,10 @@ impl TunnelSignal {
                 b.extend_from_slice(&block.to_be_bytes());
                 b.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
                 b.extend_from_slice(bytes);
+            }
+            TunnelSignal::Credit { delivered } => {
+                b.push(Self::TAG_CREDIT);
+                b.extend_from_slice(&delivered.to_be_bytes());
             }
         }
         b
@@ -168,6 +180,13 @@ impl TunnelSignal {
                 }
                 let bytes = buf[13..end].to_vec();
                 Some((TunnelSignal::ReliableData { block, bytes }, end))
+            }
+            Self::TAG_CREDIT => {
+                if buf.len() < 1 + 8 {
+                    return None;
+                }
+                let delivered = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Some((TunnelSignal::Credit { delivered }, 9))
             }
             // Unknown tag: consume one byte to resync rather than deadlock.
             _ => Some((TunnelSignal::BlockCount { total: u64::MAX }, 1)),
@@ -795,6 +814,7 @@ mod tests {
                 block: 4,
                 bytes: vec![1, 2, 3, 4, 5],
             },
+            TunnelSignal::Credit { delivered: 98765 },
         ];
         for sig in cases {
             let bytes = sig.encode();

@@ -1125,3 +1125,106 @@ async fn unreachable_target_closes_client_connection() {
         Err(_) => panic!("client connection hung: server did not reset on unreachable target"),
     }
 }
+
+/// The flow-control credit is the reverse signal that lets the sender bound
+/// in-flight blocks. If that signal is delayed or lost, a naive credit scheme
+/// would deadlock once the window fills. This test drives a payload larger than
+/// the credit window with ALL credits suppressed (the extreme case), and
+/// asserts the transfer still completes intact — proving the sender's
+/// probe-timeout backstop keeps the stream advancing (slower, never stuck).
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn credit_suppressed_still_completes_via_probe() {
+    let _guard = E2E_LOCK.lock().await;
+
+    // Suppress every flow-control credit for the duration of this test.
+    raptun_core::run::set_test_credit_drop_one_in(1);
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+    let cfg = fec_config();
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_ep = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+    };
+    let server_addr = server_ep.local_addr().unwrap();
+    drop(server_ep);
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client_listener = TcpListener::bind(local_bind).await.unwrap();
+    let local_addr = client_listener.local_addr().unwrap();
+    drop(client_listener);
+
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // ~5 MiB: with an ~18 KB block that is ~290 blocks, comfortably past the
+    // 256-block credit window, so the window fills and the probe path is the
+    // only thing that can keep the transfer moving under suppressed credits.
+    const PAYLOAD_LEN: usize = 5 * 1024 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+
+    let conn = connect_with_retry(local_addr).await;
+    let (mut read_half, mut write_half) = conn.into_split();
+    let writer_payload = payload.clone();
+    let writer = tokio::spawn(async move {
+        write_half.write_all(&writer_payload).await.unwrap();
+        write_half.shutdown().await.unwrap();
+    });
+
+    let mut got = Vec::with_capacity(PAYLOAD_LEN);
+    let mut buf = vec![0u8; 65536];
+    // Generous deadline: with credits suppressed the tail advances one block per
+    // ~500 ms probe, so it is slow but must still finish. This asserts "credit
+    // loss only slows, never deadlocks."
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while got.len() < payload.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, read_half.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    let _ = writer.await;
+
+    // Reset the hook so it can't leak into other serialized tests.
+    raptun_core::run::set_test_credit_drop_one_in(0);
+
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "suppressed-credit transfer stalled: delivered {} of {} bytes (probe backstop failed)",
+        got.len(),
+        expected.len()
+    );
+    assert_eq!(
+        got, expected,
+        "payload must round-trip intact despite suppressed credits"
+    );
+}

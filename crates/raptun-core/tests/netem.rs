@@ -294,6 +294,9 @@ fn run_scenario(
                         );
                         assembled.extend_from_slice(&out);
                     }
+                    // Flow-control credit is a live-path optimization; the
+                    // deterministic netem model does not gate on it.
+                    TunnelSignal::Credit { .. } => {}
                 }
             }
         }
