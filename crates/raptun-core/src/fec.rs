@@ -291,13 +291,18 @@ pub struct FecSender {
     oldest_retained: BlockId,
 }
 
-/// How many of the most recently sent blocks the sender retains for possible
-/// NACK top-ups and reliable retransmits. A block older than this behind the
-/// send frontier has, in every convergent case, already been delivered or
-/// reliably retransmitted; retaining it further only grows memory without
-/// bound on long-lived connections. This window is large enough to cover many
-/// RTTs of in-flight blocks while keeping per-tunnel memory flat.
-const SENDER_RETAIN_BLOCKS: u64 = 1024;
+/// Upper bound on the *bytes* of source data a sender retains for possible NACK
+/// top-ups and reliable retransmits, per tunnel. A block older than this behind
+/// the send frontier has, in every convergent case, already been delivered or
+/// reliably retransmitted; retaining it further only grows memory.
+///
+/// This is a *byte* budget, not a block count, so per-tunnel memory is flat and
+/// independent of the block geometry K. The previous fixed 1024-block window
+/// meant ~2·K·symbol_size·1024 bytes per tunnel (~38 MB at the default
+/// geometry, since each block is retained as both an encoder and a raw payload
+/// copy), so a few hundred concurrent large transfers exhausted RAM. Bounding
+/// by bytes keeps the worst case predictable regardless of concurrency.
+const SENDER_RETAIN_BYTES: u64 = 4 * 1024 * 1024;
 
 impl FecSender {
     pub fn new(stream_id: StreamId, symbol_size: u16, k: u32) -> Self {
@@ -311,6 +316,16 @@ impl FecSender {
             payloads: HashMap::new(),
             oldest_retained: 0,
         }
+    }
+
+    /// How many recent blocks to retain, derived from the byte budget and this
+    /// tunnel's block size. At least 1 so a just-sent block can always be
+    /// NACK-topped-up or reliably retransmitted. Each retained block costs
+    /// roughly two source copies (the encoder's padded block plus the raw
+    /// payload), hence the `2 *` in the denominator.
+    fn retain_blocks(&self) -> u64 {
+        let per_block = 2 * self.block_payload().max(1) as u64;
+        (SENDER_RETAIN_BYTES / per_block).max(1)
     }
 
     /// Application payload capacity of one block at this geometry.
@@ -357,10 +372,11 @@ impl FecSender {
     /// Drop retained state for blocks older than the retention window. Cheap:
     /// only runs when the frontier advances past the window edge.
     fn evict_old_blocks(&mut self) {
-        if self.next_block <= SENDER_RETAIN_BLOCKS {
+        let retain = self.retain_blocks();
+        if self.next_block <= retain {
             return;
         }
-        let cutoff = self.next_block - SENDER_RETAIN_BLOCKS;
+        let cutoff = self.next_block - retain;
         // Retiring by exact id keeps this O(evicted) rather than scanning the
         // whole map; the frontier advances by a handful of blocks per burst.
         for block_id in self.oldest_retained..cutoff {
@@ -1049,7 +1065,8 @@ mod tests {
     fn sender_retention_is_bounded() {
         let mut sender = FecSender::new(1, SYM, 2);
         let payload = vec![0xABu8; sender.block_payload()];
-        let total = SENDER_RETAIN_BLOCKS + 50;
+        let window = sender.retain_blocks();
+        let total = window + 50;
         for _ in 0..total {
             let _ = sender.encode_one_block(&payload, 0);
         }
@@ -1064,9 +1081,32 @@ mod tests {
         );
         // Retained maps stay within the window (plus the block just added).
         assert!(
-            sender.payloads.len() as u64 <= SENDER_RETAIN_BLOCKS + 1,
+            sender.payloads.len() as u64 <= window + 1,
             "retained payloads bounded by the window, got {}",
             sender.payloads.len()
+        );
+    }
+
+    /// The retention window is a byte budget: retained source bytes stay under
+    /// `SENDER_RETAIN_BYTES` regardless of the block geometry.
+    #[test]
+    fn sender_retention_byte_budget() {
+        let mut sender = FecSender::new(1, SYM, 8);
+        let cap = sender.block_payload();
+        let payload = vec![0x5Au8; cap];
+        for _ in 0..(sender.retain_blocks() + 100) {
+            let _ = sender.encode_one_block(&payload, 0);
+        }
+        // Retained raw payloads must not exceed the byte budget (with one block
+        // of slack for the just-added block).
+        let retained_bytes = sender
+            .payloads
+            .values()
+            .map(|p| p.len() as u64)
+            .sum::<u64>();
+        assert!(
+            retained_bytes <= SENDER_RETAIN_BYTES + cap as u64,
+            "retained payload bytes {retained_bytes} exceed budget {SENDER_RETAIN_BYTES}"
         );
     }
 }
