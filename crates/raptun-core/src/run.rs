@@ -226,13 +226,14 @@ fn spawn_client_heartbeat(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut loss_tracker = crate::telemetry::LossTracker::new();
         // Skip the immediate first tick so the heartbeat doesn't fire at t=0
         // right after the startup logs.
         ticker.tick().await;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let sample = crate::session::read_telemetry(&conn);
+                    let sample = crate::session::read_telemetry(&conn, &mut loss_tracker);
                     tracing::info!(
                         rtt_ms = sample.smoothed_rtt.as_millis(),
                         cwnd_bytes = sample.cwnd_bytes,
@@ -760,6 +761,7 @@ async fn run_fec_tunnel(
     let down_conn = conn.clone();
     let down_sig = sig_tx.clone();
     let mut classifier = crate::telemetry::RegimeClassifier::new();
+    let mut loss_tracker = crate::telemetry::LossTracker::new();
     let down = async move {
         let mut inbound = inbound;
         let mut receiver = FecReceiver::new(symbol_size, k);
@@ -810,7 +812,7 @@ async fn run_fec_tunnel(
                 _ = ticker.tick() => {
                     // Refresh telemetry-derived link state + budget ceiling, then
                     // arbitrate stalled blocks and emit NACKs / reliable requests.
-                    let sample = crate::session::read_telemetry(&down_conn);
+                    let sample = crate::session::read_telemetry(&down_conn, &mut loss_tracker);
                     let link = classifier.to_link_state(sample);
                     budget.refresh_ceiling(link.cwnd_bytes());
                     for sig in receiver.tick(&link, &budget, Instant::now()) {

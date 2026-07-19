@@ -26,7 +26,7 @@ use raptun_proto::control::{FecParams, Hello, HelloAck, Message};
 use raptun_proto::{Decode, Encode};
 
 use crate::config::RuntimeConfig;
-use crate::telemetry::{RegimeClassifier, TransportSample};
+use crate::telemetry::{LossTracker, RegimeClassifier, TransportSample};
 use crate::{CoreError, Result};
 
 /// Maximum control message size we will accept, to bound a peer's allocation.
@@ -296,13 +296,14 @@ pub async fn recv_datagram(conn: &Connection) -> Result<Bytes> {
 
 /// Sample the transport's live telemetry into the FEC layer's input shape.
 ///
-/// Loss rate is derived from the path's lost/sent packet counters. This is the
-/// exact signal kcptun cannot see (it runs above KCP, blind to the real path).
-pub fn read_telemetry(conn: &Connection) -> TransportSample {
+/// Loss rate is the *windowed* loss since the last sample (via `tracker`), not
+/// the connection-lifetime cumulative ratio — see [`LossTracker`] for why the
+/// raw ratio is misleading. This is the exact signal kcptun cannot see (it runs
+/// above KCP, blind to the real path).
+pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> TransportSample {
     let stats = conn.stats();
     let path = stats.path;
-    let sent = path.sent_packets.max(1);
-    let loss_rate = path.lost_packets as f64 / sent as f64;
+    let loss_rate = tracker.window_loss(path.sent_packets, path.lost_packets);
     TransportSample {
         smoothed_rtt: conn.rtt(),
         // quinn-proto exposes rtt but not rttvar publicly; approximate the
@@ -325,6 +326,7 @@ pub struct Session {
     strategy: FecStrategy,
     budget: Arc<RepairBudget>,
     classifier: RegimeClassifier,
+    loss_tracker: LossTracker,
     /// Effective FEC params after handshake negotiation.
     fec: FecParams,
 }
@@ -344,6 +346,7 @@ impl Session {
             strategy,
             budget,
             classifier: RegimeClassifier::new(),
+            loss_tracker: LossTracker::new(),
             fec,
         }
     }
@@ -375,7 +378,7 @@ impl Session {
     /// Returns `true` if the repair ratio changed enough to warrant announcing a
     /// [`Message::FecReconfig`] to the peer.
     pub fn control_tick(&mut self) -> bool {
-        let sample = read_telemetry(&self.conn);
+        let sample = read_telemetry(&self.conn, &mut self.loss_tracker);
         let link = self.classifier.to_link_state(sample);
         self.budget.refresh_ceiling(link.cwnd_bytes());
         self.strategy.update(&link)
