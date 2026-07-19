@@ -7,3 +7,6 @@
 # Editor / OS cruft
 .DS_Store
 *.swp
+
+# Stress-test run artifacts
+/stress/results/

@@ -501,6 +501,9 @@ impl Cli {
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,
             heartbeat: (self.heartbeat > 0).then(|| Duration::from_secs(self.heartbeat)),
+            // Loss-detection / reordering knobs use their tuned defaults; they
+            // are not (yet) exposed as CLI flags.
+            ..TransportConfig::default()
         };
 
         RuntimeConfig {

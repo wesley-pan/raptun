@@ -79,6 +79,24 @@ pub fn build_transport(cfg: &TransportConfig) -> Result<Arc<QuinnTransport>> {
         t.datagram_receive_buffer_size(None);
     }
 
+    // Loss-detection / reordering tolerance. A shaped link (e.g. the stress
+    // relay, or any path with per-packet jitter) can spread adjacent packets
+    // across a wide delay window. Quinn's defaults (packet_threshold=3,
+    // time_threshold=1.125·RTT) then misread late-but-arriving packets as
+    // lost, which trips black-hole detection and collapses the cwnd - the root
+    // cause of the spurious high loss_pct and throughput collapse seen under
+    // reordering. Raising these lets reordered packets survive so the cwnd
+    // stays stable and the FEC path is not drowned in spurious repair. The
+    // FEC layer (RaptorQ) is itself order-agnostic; this tuning stops QUIC's
+    // loss detector from fighting it.
+    t.packet_threshold(cfg.reorder_packet_threshold);
+    t.time_threshold(cfg.reorder_time_threshold);
+    t.persistent_congestion_threshold(cfg.persistent_congestion_threshold);
+    t.min_mtu(cfg.min_mtu);
+    if let Some(rtt) = cfg.initial_rtt {
+        t.initial_rtt(rtt);
+    }
+
     Ok(Arc::new(t))
 }
 
@@ -138,6 +156,32 @@ mod tests {
         let cfg = TransportConfig::default();
         assert!(build_transport(&cfg).is_ok());
         assert_eq!(max_symbol_payload(&cfg), Some(cfg.mtu));
+    }
+
+    #[test]
+    fn reorder_tuning_defaults_are_set() {
+        let cfg = TransportConfig::default();
+        assert_eq!(cfg.reorder_packet_threshold, 8);
+        assert!((cfg.reorder_time_threshold - 2.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.persistent_congestion_threshold, 5);
+        assert_eq!(cfg.min_mtu, 1200);
+        assert!(cfg.initial_rtt.is_none());
+    }
+
+    #[test]
+    fn transport_applies_custom_reorder_tuning() {
+        // Custom loss-detection knobs must be accepted by Quinn. Quinn does not
+        // expose getters to read them back, so this asserts acceptance, not
+        // values - the real proof is the stress run's loss_pct/cwnd behaviour.
+        let cfg = TransportConfig {
+            reorder_packet_threshold: 16,
+            reorder_time_threshold: 3.0,
+            persistent_congestion_threshold: 7,
+            min_mtu: 1280,
+            initial_rtt: Some(std::time::Duration::from_millis(120)),
+            ..TransportConfig::default()
+        };
+        assert!(build_transport(&cfg).is_ok());
     }
 
     #[test]

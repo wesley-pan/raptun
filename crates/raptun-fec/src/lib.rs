@@ -37,7 +37,7 @@ pub mod encoder;
 pub mod link;
 pub mod strategy;
 
-pub use budget::RepairBudget;
+pub use budget::{RepairBudget, SendWindow};
 pub use codec::{RaptorQBlockDecoderImpl, RaptorQBlockEncoder};
 pub use decoder::{BlockManager, BlockOutcome, DecoderAction};
 pub use encoder::{BlockEncoder, StreamEncoder};

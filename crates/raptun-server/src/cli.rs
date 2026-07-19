@@ -448,6 +448,9 @@ impl Cli {
             // The heartbeat log is a client-side liveness aid; the server does
             // not emit it.
             heartbeat: None,
+            // Loss-detection / reordering knobs use their tuned defaults; they
+            // are not (yet) exposed as CLI flags.
+            ..TransportConfig::default()
         };
 
         RuntimeConfig {

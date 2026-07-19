@@ -71,6 +71,22 @@ pub enum TunnelSignal {
     /// Sender → receiver: the reliable copy of `block`'s original payload bytes.
     /// Injected directly into the receiver's reorder buffer, bypassing RaptorQ.
     ReliableData { block: BlockId, bytes: Vec<u8> },
+    /// Receiver → sender: `delivered` is the number of blocks handed to the
+    /// local TCP so far (the receiver's cumulative delivery high-water). The
+    /// sender uses it as a flow-control credit — it may keep at most a bounded
+    /// number of blocks in flight beyond what the peer has delivered, so it
+    /// cannot outrun the link and self-inflict congestion loss. Modelled on
+    /// smux's `cmdUPD` (consumed/window) credit, but block-denominated.
+    Credit { delivered: u64 },
+    /// Receiver -> sender: block `block` has been decoded successfully, so its
+    /// symbols are no longer needed. The sender may release the retained
+    /// encoder/payload for this block immediately. Unlike `Credit` (which
+    /// advances only with in-order delivery), `BlockAck` fires per-block on
+    /// decode, so a block that decoded out of order still frees its sender
+    /// state without waiting for the delivery floor to reach it. This is the
+    /// "decoded -> ack -> release" signal that keeps sender memory bounded by
+    /// in-flight blocks rather than by the byte retention window.
+    BlockAck { block: BlockId },
 }
 
 impl TunnelSignal {
@@ -79,6 +95,8 @@ impl TunnelSignal {
     const TAG_RELIABLE_REQUEST: u8 = 3;
     const TAG_RELIABLE_DATA: u8 = 4;
     const TAG_HIGH_WATER: u8 = 5;
+    const TAG_CREDIT: u8 = 6;
+    const TAG_BLOCKACK: u8 = 7;
 
     /// Upper bound on a `ReliableData` payload we will accept, to cap the
     /// allocation a peer can force. One block is at most `K * symbol_size`;
@@ -112,6 +130,14 @@ impl TunnelSignal {
                 b.extend_from_slice(&block.to_be_bytes());
                 b.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
                 b.extend_from_slice(bytes);
+            }
+            TunnelSignal::Credit { delivered } => {
+                b.push(Self::TAG_CREDIT);
+                b.extend_from_slice(&delivered.to_be_bytes());
+            }
+            TunnelSignal::BlockAck { block } => {
+                b.push(Self::TAG_BLOCKACK);
+                b.extend_from_slice(&block.to_be_bytes());
             }
         }
         b
@@ -168,6 +194,20 @@ impl TunnelSignal {
                 }
                 let bytes = buf[13..end].to_vec();
                 Some((TunnelSignal::ReliableData { block, bytes }, end))
+            }
+            Self::TAG_CREDIT => {
+                if buf.len() < 1 + 8 {
+                    return None;
+                }
+                let delivered = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Some((TunnelSignal::Credit { delivered }, 9))
+            }
+            Self::TAG_BLOCKACK => {
+                if buf.len() < 1 + 8 {
+                    return None;
+                }
+                let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Some((TunnelSignal::BlockAck { block }, 9))
             }
             // Unknown tag: consume one byte to resync rather than deadlock.
             _ => Some((TunnelSignal::BlockCount { total: u64::MAX }, 1)),
@@ -291,13 +331,18 @@ pub struct FecSender {
     oldest_retained: BlockId,
 }
 
-/// How many of the most recently sent blocks the sender retains for possible
-/// NACK top-ups and reliable retransmits. A block older than this behind the
-/// send frontier has, in every convergent case, already been delivered or
-/// reliably retransmitted; retaining it further only grows memory without
-/// bound on long-lived connections. This window is large enough to cover many
-/// RTTs of in-flight blocks while keeping per-tunnel memory flat.
-const SENDER_RETAIN_BLOCKS: u64 = 1024;
+/// Upper bound on the *bytes* of source data a sender retains for possible NACK
+/// top-ups and reliable retransmits, per tunnel. A block older than this behind
+/// the send frontier has, in every convergent case, already been delivered or
+/// reliably retransmitted; retaining it further only grows memory.
+///
+/// This is a *byte* budget, not a block count, so per-tunnel memory is flat and
+/// independent of the block geometry K. The previous fixed 1024-block window
+/// meant ~2·K·symbol_size·1024 bytes per tunnel (~38 MB at the default
+/// geometry, since each block is retained as both an encoder and a raw payload
+/// copy), so a few hundred concurrent large transfers exhausted RAM. Bounding
+/// by bytes keeps the worst case predictable regardless of concurrency.
+const SENDER_RETAIN_BYTES: u64 = 4 * 1024 * 1024;
 
 impl FecSender {
     pub fn new(stream_id: StreamId, symbol_size: u16, k: u32) -> Self {
@@ -311,6 +356,16 @@ impl FecSender {
             payloads: HashMap::new(),
             oldest_retained: 0,
         }
+    }
+
+    /// How many recent blocks to retain, derived from the byte budget and this
+    /// tunnel's block size. At least 1 so a just-sent block can always be
+    /// NACK-topped-up or reliably retransmitted. Each retained block costs
+    /// roughly two source copies (the encoder's padded block plus the raw
+    /// payload), hence the `2 *` in the denominator.
+    fn retain_blocks(&self) -> u64 {
+        let per_block = 2 * self.block_payload().max(1) as u64;
+        (SENDER_RETAIN_BYTES / per_block).max(1)
     }
 
     /// Application payload capacity of one block at this geometry.
@@ -357,10 +412,11 @@ impl FecSender {
     /// Drop retained state for blocks older than the retention window. Cheap:
     /// only runs when the frontier advances past the window edge.
     fn evict_old_blocks(&mut self) {
-        if self.next_block <= SENDER_RETAIN_BLOCKS {
+        let retain = self.retain_blocks();
+        if self.next_block <= retain {
             return;
         }
-        let cutoff = self.next_block - SENDER_RETAIN_BLOCKS;
+        let cutoff = self.next_block - retain;
         // Retiring by exact id keeps this O(evicted) rather than scanning the
         // whole map; the frontier advances by a handful of blocks per burst.
         for block_id in self.oldest_retained..cutoff {
@@ -430,6 +486,11 @@ pub struct FecReceiver {
     /// control tick does not re-request them every cycle while the reliable data
     /// is in flight.
     reliable_requested: std::collections::HashSet<BlockId>,
+    /// Blocks decoded since the last `drain_acks` - queued for a `BlockAck`
+    /// signal to the sender so it can release their retained state. A block is
+    /// pushed the moment it decodes (enters `ready`), not when it is delivered
+    /// in order, so an out-of-order decode still frees sender memory promptly.
+    pending_acks: Vec<BlockId>,
 }
 
 impl FecReceiver {
@@ -444,6 +505,7 @@ impl FecReceiver {
             total_blocks: None,
             high_water: 0,
             reliable_requested: std::collections::HashSet::new(),
+            pending_acks: Vec::new(),
         }
     }
 
@@ -494,6 +556,10 @@ impl FecReceiver {
         {
             self.managers.remove(&block_id);
             self.ready.insert(block_id, bytes);
+            // Queue a BlockAck: the block decoded, so the sender can release
+            // its encoder/payload for this block now (not when it is delivered
+            // in order).
+            self.pending_acks.push(block_id);
         }
 
         self.drain_ready()
@@ -520,6 +586,14 @@ impl FecReceiver {
     /// oracle (`later_blocks_progressing`).
     pub fn highest_delivered(&self) -> BlockId {
         self.next_deliver
+    }
+
+    /// Take the blocks decoded since the last call, to be acknowledged to the
+    /// sender via [`TunnelSignal::BlockAck`]. Each decoded block appears once;
+    /// the caller drains and sends after each `on_symbol` / `on_reliable_block`
+    /// burst and/or on the control tick.
+    pub fn drain_acks(&mut self) -> Vec<BlockId> {
+        std::mem::take(&mut self.pending_acks)
     }
 
     /// Iterate the block ids with live (undecoded) managers, for control-tick
@@ -650,6 +724,9 @@ impl FecReceiver {
         self.managers.remove(&block_id);
         self.reliable_requested.remove(&block_id);
         self.ready.insert(block_id, bytes);
+        // A reliably-completed block is also done with the sender's retained
+        // state, so ack it just like a decoded one.
+        self.pending_acks.push(block_id);
         self.drain_ready()
     }
 }
@@ -779,6 +856,7 @@ mod tests {
                 block: 4,
                 bytes: vec![1, 2, 3, 4, 5],
             },
+            TunnelSignal::Credit { delivered: 98765 },
         ];
         for sig in cases {
             let bytes = sig.encode();
@@ -1049,7 +1127,8 @@ mod tests {
     fn sender_retention_is_bounded() {
         let mut sender = FecSender::new(1, SYM, 2);
         let payload = vec![0xABu8; sender.block_payload()];
-        let total = SENDER_RETAIN_BLOCKS + 50;
+        let window = sender.retain_blocks();
+        let total = window + 50;
         for _ in 0..total {
             let _ = sender.encode_one_block(&payload, 0);
         }
@@ -1064,9 +1143,32 @@ mod tests {
         );
         // Retained maps stay within the window (plus the block just added).
         assert!(
-            sender.payloads.len() as u64 <= SENDER_RETAIN_BLOCKS + 1,
+            sender.payloads.len() as u64 <= window + 1,
             "retained payloads bounded by the window, got {}",
             sender.payloads.len()
+        );
+    }
+
+    /// The retention window is a byte budget: retained source bytes stay under
+    /// `SENDER_RETAIN_BYTES` regardless of the block geometry.
+    #[test]
+    fn sender_retention_byte_budget() {
+        let mut sender = FecSender::new(1, SYM, 8);
+        let cap = sender.block_payload();
+        let payload = vec![0x5Au8; cap];
+        for _ in 0..(sender.retain_blocks() + 100) {
+            let _ = sender.encode_one_block(&payload, 0);
+        }
+        // Retained raw payloads must not exceed the byte budget (with one block
+        // of slack for the just-added block).
+        let retained_bytes = sender
+            .payloads
+            .values()
+            .map(|p| p.len() as u64)
+            .sum::<u64>();
+        assert!(
+            retained_bytes <= SENDER_RETAIN_BYTES + cap as u64,
+            "retained payload bytes {retained_bytes} exceed budget {SENDER_RETAIN_BYTES}"
         );
     }
 }

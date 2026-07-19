@@ -26,7 +26,7 @@ use raptun_proto::control::{FecParams, Hello, HelloAck, Message};
 use raptun_proto::{Decode, Encode};
 
 use crate::config::RuntimeConfig;
-use crate::telemetry::{RegimeClassifier, TransportSample};
+use crate::telemetry::{LossTracker, RegimeClassifier, TransportSample};
 use crate::{CoreError, Result};
 
 /// Maximum control message size we will accept, to bound a peer's allocation.
@@ -296,13 +296,40 @@ pub async fn recv_datagram(conn: &Connection) -> Result<Bytes> {
 
 /// Sample the transport's live telemetry into the FEC layer's input shape.
 ///
-/// Loss rate is derived from the path's lost/sent packet counters. This is the
-/// exact signal kcptun cannot see (it runs above KCP, blind to the real path).
-pub fn read_telemetry(conn: &Connection) -> TransportSample {
+/// Loss rate is the *windowed* loss since the last sample (via `tracker`), not
+/// the connection-lifetime cumulative ratio — see [`LossTracker`] for why the
+/// raw ratio is misleading. This is the exact signal kcptun cannot see (it runs
+/// above KCP, blind to the real path).
+pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> TransportSample {
     let stats = conn.stats();
     let path = stats.path;
-    let sent = path.sent_packets.max(1);
-    let loss_rate = path.lost_packets as f64 / sent as f64;
+    let loss_rate = tracker.window_loss(path.sent_packets, path.lost_packets);
+
+    // 诊断:当窗口丢包率 > 5% 且通过节流时,打印 Quinn 计数器的来源分解,
+    // 用来区分"真实丢包"与"指标误判"。三条判据:
+    //   1. 拥塞信号 congestion_events / black_holes_detected 是否随 lost_packets
+    //      增长 —— 增长即真拥塞;不动则可能是误判。
+    //   2. UDP socket 层:跨端对照 client.udp_tx_dgrams vs server.udp_rx_dgrams。
+    //      relay drop=0 时若 server.udp_rx ≪ client.udp_tx,说明包在 relay/内核
+    //      丢了(真实丢包,假设 relay 掉队成立);若两端 UDP 计数对得上但
+    //      lost_packets 仍高,则是 QUIC 层把包误判为 lost(指标不准)。
+    //   3. lost_bytes / lost_packets ≈ 平均丢包大小,接近 MTU 说明丢的是满载数据包。
+    if loss_rate > 0.05 && tracker.allow_diag() {
+        tracing::info!(
+            target: "raptun_core::telemetry",
+            loss_pct = format!("{:.2}", loss_rate * 100.0),
+            sent_pkts = path.sent_packets,
+            lost_pkts = path.lost_packets,
+            lost_bytes = path.lost_bytes,
+            congestion_events = path.congestion_events,
+            black_holes = path.black_holes_detected,
+            udp_tx_dgrams = stats.udp_tx.datagrams,
+            udp_rx_dgrams = stats.udp_rx.datagrams,
+            cwnd_bytes = path.cwnd,
+            "quinn loss-source breakdown (path vs udp vs congestion)"
+        );
+    }
+
     TransportSample {
         smoothed_rtt: conn.rtt(),
         // quinn-proto exposes rtt but not rttvar publicly; approximate the
@@ -325,6 +352,7 @@ pub struct Session {
     strategy: FecStrategy,
     budget: Arc<RepairBudget>,
     classifier: RegimeClassifier,
+    loss_tracker: LossTracker,
     /// Effective FEC params after handshake negotiation.
     fec: FecParams,
 }
@@ -344,6 +372,7 @@ impl Session {
             strategy,
             budget,
             classifier: RegimeClassifier::new(),
+            loss_tracker: LossTracker::new(),
             fec,
         }
     }
@@ -375,7 +404,7 @@ impl Session {
     /// Returns `true` if the repair ratio changed enough to warrant announcing a
     /// [`Message::FecReconfig`] to the peer.
     pub fn control_tick(&mut self) -> bool {
-        let sample = read_telemetry(&self.conn);
+        let sample = read_telemetry(&self.conn, &mut self.loss_tracker);
         let link = self.classifier.to_link_state(sample);
         self.budget.refresh_ceiling(link.cwnd_bytes());
         self.strategy.update(&link)
