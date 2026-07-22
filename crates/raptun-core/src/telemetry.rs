@@ -6,7 +6,21 @@
 //! the **cross-tick congestion-window history** needed to tell a congestion cut
 //! (window shrinking) from steady-state random loss (window stable/growing).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use raptun_fec::link::{LinkState, LossRegime};
+
+/// Global throttle for the loss-source diagnostic log.
+///
+/// `LossTracker::allow_diag` is per-tunnel (500 ms), but a single QUIC connection
+/// can carry many tunnels that all see the same path stats.  Without a global
+/// gate, every tunnel fires the diagnostic simultaneously the first time loss
+/// crosses 5 %, producing a burst of identical log lines.  This atomic records
+/// the last wall-clock millisecond the diagnostic was emitted by *any* tunnel and
+/// enforces a connection-wide minimum interval.
+static LAST_DIAG_MS: AtomicU64 = AtomicU64::new(0);
+/// Minimum interval between loss-source diagnostics, connection-wide.
+const DIAG_INTERVAL_MS: u64 = 2_000; // 2 s — diagnostic, not a heartbeat
 
 /// Tracks QUIC's cumulative sent/lost packet counters across telemetry samples
 /// to derive a *windowed* loss rate — loss over the interval since the last
@@ -56,18 +70,40 @@ impl LossTracker {
     }
 
     /// Return `true` at most once per `DIAG_INTERVAL` so the loss-source
-    /// diagnostic in `read_telemetry` doesn't fire on every 20ms tick. Returns
-    /// `true` (and stamps the clock) when enough time has elapsed.
+    /// diagnostic in `read_telemetry` doesn't fire on every 20ms tick.
+    ///
+    /// The per-tracker timer (500 ms) prevents each tunnel from hammering the
+    /// global atomic on every tick; the global atomic (2 s) prevents all
+    /// tunnels on a shared connection from firing simultaneously the first
+    /// time loss crosses the threshold.
     pub(crate) fn allow_diag(&mut self) -> bool {
-        const DIAG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const LOCAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         let now = std::time::Instant::now();
-        match self.last_diag {
-            Some(t) if now.duration_since(t) < DIAG_INTERVAL => false,
-            _ => {
-                self.last_diag = Some(now);
-                true
+        if let Some(t) = self.last_diag {
+            if now.duration_since(t) < LOCAL_INTERVAL {
+                return false;
             }
         }
+        // Global gate: at most one tunnel per connection (really per process,
+        // but the log is connection-stats anyway) emits the diagnostic per
+        // DIAG_INTERVAL_MS.  If two tunnels race the CAS the loser backs off
+        // until its next local window.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = LAST_DIAG_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < DIAG_INTERVAL_MS {
+            return false;
+        }
+        if LAST_DIAG_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.last_diag = Some(now);
+        true
     }
 }
 
