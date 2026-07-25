@@ -315,9 +315,14 @@ pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> Transport
     //      lost_packets 仍高,则是 QUIC 层把包误判为 lost(指标不准)。
     //   3. lost_bytes / lost_packets ≈ 平均丢包大小,接近 MTU 说明丢的是满载数据包。
     if loss_rate > 0.05 && tracker.allow_diag() {
+        // Log the loss over the whole diagnostic interval (~2 s), not the 20 ms
+        // `loss_rate` tick that tripped the gate: the latter has a tiny
+        // denominator and swings to 100% on a single late packet. `loss_rate`
+        // still drives the >5% trigger and the FEC controller unchanged.
+        let diag_pct = tracker.diag_loss(path.sent_packets, path.lost_packets);
         tracing::info!(
             target: "raptun_core::telemetry",
-            loss_pct = format!("{:.2}", loss_rate * 100.0),
+            loss_pct = format!("{:.2}", diag_pct * 100.0),
             sent_pkts = path.sent_packets,
             lost_pkts = path.lost_packets,
             lost_bytes = path.lost_bytes,

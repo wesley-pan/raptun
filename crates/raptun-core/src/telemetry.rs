@@ -36,6 +36,14 @@ const DIAG_INTERVAL_MS: u64 = 2_000; // 2 s — diagnostic, not a heartbeat
 #[derive(Debug, Default)]
 pub struct LossTracker {
     prev: Option<(u64, u64)>, // (sent, lost) at the previous sample
+    /// Separate baseline advanced only when the loss-source diagnostic actually
+    /// fires (~every 2 s), so the logged loss rate covers the whole
+    /// diagnostic interval rather than the last 20 ms `read_telemetry` tick.
+    /// `read_telemetry` runs every 20 ms, so `prev`-based loss is a
+    /// tiny-denominator sample that swings wildly (a single late packet reads as
+    /// 100%). Keying the *logged* figure on its own coarse baseline makes the
+    /// diagnostic reflect what the link did over the interval it represents.
+    diag_prev: Option<(u64, u64)>,
     /// Wall-clock time the loss-source diagnostic was last emitted. Throttles
     /// the log added to `read_telemetry`: that fn is called from a 20ms
     /// downstream tick *and* a 1s heartbeat, so a sustained high-loss run
@@ -66,6 +74,30 @@ impl LossTracker {
             }
         };
         self.prev = Some((sent, lost));
+        rate
+    }
+
+    /// Loss rate over the interval since the last *diagnostic*, and advance the
+    /// diagnostic baseline. Call this only when about to emit the loss-source
+    /// diagnostic (i.e. right after `allow_diag` returns true): unlike
+    /// `window_loss`, whose 20 ms cadence gives a tiny, noisy denominator, this
+    /// spans the full ~2 s diagnostic interval, so the logged figure reflects
+    /// the link over the window the log line actually represents. Returns 0.0
+    /// on the first diagnostic (baseline only) or a window with no new packets.
+    pub(crate) fn diag_loss(&mut self, sent: u64, lost: u64) -> f64 {
+        let rate = match self.diag_prev {
+            None => 0.0,
+            Some((ps, pl)) => {
+                let d_sent = sent.saturating_sub(ps);
+                let d_lost = lost.saturating_sub(pl);
+                if d_sent == 0 {
+                    0.0
+                } else {
+                    (d_lost as f64 / d_sent as f64).clamp(0.0, 1.0)
+                }
+            }
+        };
+        self.diag_prev = Some((sent, lost));
         rate
     }
 
@@ -227,5 +259,21 @@ mod tests {
         assert_eq!(t.window_loss(500, 10), 0.0);
         // Counter reset (e.g. reconnect) must not panic or go negative.
         assert_eq!(t.window_loss(5, 1), 0.0);
+    }
+
+    #[test]
+    fn diag_loss_spans_its_own_interval_not_the_20ms_tick() {
+        let mut t = LossTracker::new();
+        // 20ms ticks churn `window_loss` many times without a diagnostic.
+        t.window_loss(1000, 100);
+        t.window_loss(1010, 110); // last tick: 10 lost / 10 sent = 100% (noise)
+                                  // First diagnostic only establishes the diag baseline.
+        assert_eq!(t.diag_loss(1010, 110), 0.0);
+        // More 20ms ticks, then the next diagnostic ~2s later: 1000 sent,
+        // 40 lost across the whole interval ⇒ 4%, NOT the 100% a single tick saw.
+        t.window_loss(1500, 130);
+        t.window_loss(2010, 150);
+        let d = t.diag_loss(2010, 150);
+        assert!((d - 0.04).abs() < 1e-9, "diag loss should be 4%, got {d}");
     }
 }
