@@ -500,6 +500,23 @@ const CREDIT_WINDOW_FLOOR_BLOCKS: u64 = 16;
 /// further backstop for pathological credit delay.
 const CREDIT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Hard upper bound on how long a single FEC tunnel may exist before it is
+/// forcibly closed, regardless of whether it is still making (slow) progress.
+///
+/// Under high link loss combined with jitter, the congestion window can
+/// collapse to a few KiB and a tunnel may take minutes to ship a single block.
+/// Without a deadline, such tunnels accumulate indefinitely — `active_tunnels`
+/// climbs without bound, client RSS balloons, and the server eventually hits
+/// `ENOBUFS` on new TCP connections to the target.  A tunnel that has not
+/// finished within this window is a lost cause: the application above it has
+/// almost certainly timed out already, and retaining its state only starves
+/// healthy tunnels of memory and file descriptors.
+///
+/// 120 s is well above the 30 s idle timeout and the ~10 s target-connect
+/// timeout; a tunnel that takes longer than this is making no meaningful
+/// progress on any real link.
+const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(120);
+
 /// Spawn the connection-wide datagram read loop that feeds the hub.
 fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
     tokio::spawn(async move {
@@ -761,6 +778,13 @@ async fn run_fec_tunnel(
         // fresh credit arrives.
         let mut credit_fresh: bool = true;
         let mut eof = false;
+        let tunnel_started_at = Instant::now();
+        // Periodic lifetime check: fires every 5 s so a tunnel that is stuck in
+        // slow progress (tiny cwnd + high loss) is eventually aborted rather
+        // than accumulating forever.  At ~5 s granularity, the worst-case
+        // lifetime overshoot is 5 s on top of TUNNEL_MAX_LIFETIME.
+        let mut lifetime_tick = tokio::time::interval(Duration::from_secs(5));
+        lifetime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !eof {
             tokio::select! {
@@ -852,6 +876,25 @@ async fn run_fec_tunnel(
                 Some(block) = ack_rx.recv() => {
                     sender.retire_block(block);
                 }
+                // Hard lifetime bound: if this tunnel has been alive for more
+                // than TUNNEL_MAX_LIFETIME without finishing, abort it. This
+                // prevents tunnel accumulation under catastrophic link
+                // conditions (tiny cwnd + high loss) where each tunnel makes
+                // vanishingly slow progress and active_tunnels grows without
+                // bound, eventually exhausting memory and OS file descriptors
+                // (ENOBUFS). The application above the tunnel has already
+                // timed out, so retaining state is pure waste.
+                _ = lifetime_tick.tick() => {
+                    if tunnel_started_at.elapsed() > TUNNEL_MAX_LIFETIME {
+                        tracing::warn!(
+                            total_blocks,
+                            delivered,
+                            elapsed_s = tunnel_started_at.elapsed().as_secs(),
+                            "tunnel lifetime exceeded: aborting"
+                        );
+                        break;
+                    }
+                }
             }
         }
         // Announce the count so the receiver knows the stream length, then keep
@@ -885,6 +928,19 @@ async fn run_fec_tunnel(
                 // `&mut` so a not-yet-fired receiver can be re-polled next
                 // iteration; a fired/closed receiver resolves immediately.
                 _ = &mut down_done_rx => break,
+                // Lifetime guard also applies post-EOF: the receiver might be
+                // stuck and never send `down_done_rx`.
+                _ = lifetime_tick.tick() => {
+                    if tunnel_started_at.elapsed() > TUNNEL_MAX_LIFETIME {
+                        tracing::warn!(
+                            total_blocks,
+                            delivered,
+                            elapsed_s = tunnel_started_at.elapsed().as_secs(),
+                            "tunnel lifetime exceeded (post-EOF): aborting"
+                        );
+                        break;
+                    }
+                }
                 else => break,
             }
         }
