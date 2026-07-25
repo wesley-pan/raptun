@@ -500,22 +500,29 @@ const CREDIT_WINDOW_FLOOR_BLOCKS: u64 = 16;
 /// further backstop for pathological credit delay.
 const CREDIT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Hard upper bound on how long a single FEC tunnel may exist before it is
-/// forcibly closed, regardless of whether it is still making (slow) progress.
+/// Hard upper bound on how long a single FEC tunnel may go *without making
+/// progress* before it is forcibly closed. This is a stall deadline, NOT an
+/// absolute lifetime: a tunnel that keeps delivering blocks (or has caught up
+/// to everything it has sent) may live arbitrarily long, which is exactly what
+/// a long-lived connection — SSH, streaming, keep-alive HTTP — needs.
 ///
 /// Under high link loss combined with jitter, the congestion window can
 /// collapse to a few KiB and a tunnel may take minutes to ship a single block.
-/// Without a deadline, such tunnels accumulate indefinitely — `active_tunnels`
-/// climbs without bound, client RSS balloons, and the server eventually hits
-/// `ENOBUFS` on new TCP connections to the target.  A tunnel that has not
-/// finished within this window is a lost cause: the application above it has
-/// almost certainly timed out already, and retaining its state only starves
-/// healthy tunnels of memory and file descriptors.
+/// Without a deadline, such genuinely-stuck tunnels accumulate indefinitely —
+/// `active_tunnels` climbs without bound, client RSS balloons, and the server
+/// eventually hits `ENOBUFS` on new TCP connections to the target. A tunnel
+/// that has delivered nothing new for this long is a lost cause: the
+/// application above it has almost certainly timed out already, and retaining
+/// its state only starves healthy tunnels of memory and file descriptors.
+///
+/// Keying on *stall* rather than absolute age is what stops the earlier bug
+/// where healthy, caught-up tunnels (`delivered == total_blocks`, 0% loss)
+/// were culled every 120 s simply for staying open.
 ///
 /// 120 s is well above the 30 s idle timeout and the ~10 s target-connect
-/// timeout; a tunnel that takes longer than this is making no meaningful
-/// progress on any real link.
-const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(120);
+/// timeout; a tunnel that makes no progress for longer than this is stuck on
+/// any real link.
+const TUNNEL_MAX_STALL: Duration = Duration::from_secs(120);
 
 /// Spawn the connection-wide datagram read loop that feeds the hub.
 fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
@@ -779,10 +786,18 @@ async fn run_fec_tunnel(
         let mut credit_fresh: bool = true;
         let mut eof = false;
         let tunnel_started_at = Instant::now();
-        // Periodic lifetime check: fires every 5 s so a tunnel that is stuck in
-        // slow progress (tiny cwnd + high loss) is eventually aborted rather
-        // than accumulating forever.  At ~5 s granularity, the worst-case
-        // lifetime overshoot is 5 s on top of TUNNEL_MAX_LIFETIME.
+        // Stall tracking for the lifetime guard below. `last_progress_at` is
+        // reset whenever the tunnel advances (a fresh block delivered) or is
+        // caught up to everything it has sent; the guard aborts only after this
+        // has gone stale for TUNNEL_MAX_STALL. `last_progress_delivered` is the
+        // `delivered` high-water at the last observed advance, so a repeated
+        // unchanged credit is not mistaken for progress.
+        let mut last_progress_at = tunnel_started_at;
+        let mut last_progress_delivered: u64 = 0;
+        // Periodic stall check: fires every 5 s so a tunnel stuck in slow
+        // progress (tiny cwnd + high loss) is eventually aborted rather than
+        // accumulating forever. At ~5 s granularity, the worst-case stall
+        // overshoot is 5 s on top of TUNNEL_MAX_STALL.
         let mut lifetime_tick = tokio::time::interval(Duration::from_secs(5));
         lifetime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -876,21 +891,28 @@ async fn run_fec_tunnel(
                 Some(block) = ack_rx.recv() => {
                     sender.retire_block(block);
                 }
-                // Hard lifetime bound: if this tunnel has been alive for more
-                // than TUNNEL_MAX_LIFETIME without finishing, abort it. This
-                // prevents tunnel accumulation under catastrophic link
-                // conditions (tiny cwnd + high loss) where each tunnel makes
-                // vanishingly slow progress and active_tunnels grows without
-                // bound, eventually exhausting memory and OS file descriptors
-                // (ENOBUFS). The application above the tunnel has already
-                // timed out, so retaining state is pure waste.
+                // Stall bound: abort a tunnel only if it has made no progress
+                // for TUNNEL_MAX_STALL. "Progress" is either delivering a new
+                // block (delivered advanced) or being fully caught up
+                // (delivered >= total_blocks) — the latter is the healthy,
+                // idle long-connection case that must NOT be culled. Keying on
+                // stall rather than absolute age prevents accumulation under
+                // catastrophic link conditions (tiny cwnd + high loss) where a
+                // tunnel makes vanishingly slow progress and active_tunnels
+                // grows without bound, eventually exhausting memory and OS file
+                // descriptors (ENOBUFS), while leaving working tunnels alone.
                 _ = lifetime_tick.tick() => {
-                    if tunnel_started_at.elapsed() > TUNNEL_MAX_LIFETIME {
+                    let caught_up = delivered >= total_blocks;
+                    let advanced = delivered > last_progress_delivered;
+                    if caught_up || advanced {
+                        last_progress_delivered = delivered;
+                        last_progress_at = Instant::now();
+                    } else if last_progress_at.elapsed() > TUNNEL_MAX_STALL {
                         tracing::warn!(
                             total_blocks,
                             delivered,
-                            elapsed_s = tunnel_started_at.elapsed().as_secs(),
-                            "tunnel lifetime exceeded: aborting"
+                            stalled_s = last_progress_at.elapsed().as_secs(),
+                            "tunnel stalled: aborting"
                         );
                         break;
                     }
@@ -918,9 +940,13 @@ async fn run_fec_tunnel(
                 }
                 // Late BlockAck: the receiver may still be decoding the last
                 // blocks after we've announced BlockCount; retire them so the
-                // sender's retained state is cleaned up.
+                // sender's retained state is cleaned up. Each ack is also fresh
+                // progress — post-EOF the credit channel no longer advances
+                // `delivered`, so decoded-block acks are the stall guard's only
+                // progress signal.
                 Some(block) = ack_rx.recv() => {
                     sender.retire_block(block);
+                    last_progress_at = Instant::now();
                 }
                 // Downstream finished: stop serving late repairs and unwind so
                 // the sig_tx clones drop, writer.finish() cascades EOF to the
@@ -928,15 +954,17 @@ async fn run_fec_tunnel(
                 // `&mut` so a not-yet-fired receiver can be re-polled next
                 // iteration; a fired/closed receiver resolves immediately.
                 _ = &mut down_done_rx => break,
-                // Lifetime guard also applies post-EOF: the receiver might be
-                // stuck and never send `down_done_rx`.
+                // Stall guard also applies post-EOF: the receiver might be stuck
+                // and never send `down_done_rx`. Abort only after no BlockAck
+                // has arrived for TUNNEL_MAX_STALL, so a slow-but-progressing
+                // drain is left to finish.
                 _ = lifetime_tick.tick() => {
-                    if tunnel_started_at.elapsed() > TUNNEL_MAX_LIFETIME {
+                    if last_progress_at.elapsed() > TUNNEL_MAX_STALL {
                         tracing::warn!(
                             total_blocks,
                             delivered,
-                            elapsed_s = tunnel_started_at.elapsed().as_secs(),
-                            "tunnel lifetime exceeded (post-EOF): aborting"
+                            stalled_s = last_progress_at.elapsed().as_secs(),
+                            "tunnel stalled (post-EOF): aborting"
                         );
                         break;
                     }
