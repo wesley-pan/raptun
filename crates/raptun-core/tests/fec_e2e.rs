@@ -100,7 +100,7 @@ async fn fec_tunnel_end_to_end() {
     // Small race window on rebind is fine for a localhost test.
     let srv_cfg = server_cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -233,7 +233,7 @@ async fn client_reconnects_after_server_restart() {
     let srv_cfg = cfg.clone();
     let srv_id = clone_identity(&identity);
     let server1 = tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -273,7 +273,7 @@ async fn client_reconnects_after_server_restart() {
     let srv_cfg = cfg.clone();
     let srv_id = clone_identity(&identity);
     let server2 = tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, srv_id, None).await;
     });
 
     // Give the client time to notice the drop (idle timeout) and reconnect with
@@ -342,7 +342,7 @@ async fn fec_recovers_under_datagram_loss() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -433,7 +433,7 @@ async fn reliable_retransmit_completes_under_unrecoverable_loss() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -550,7 +550,7 @@ async fn client_emits_periodic_heartbeat() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -694,7 +694,7 @@ async fn run_downstream_first_scenario() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, target_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, target_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -777,7 +777,7 @@ async fn many_concurrent_tunnels_do_not_stall() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -889,7 +889,7 @@ async fn shared_repair_budget_is_per_connection() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -984,7 +984,7 @@ async fn large_payload_survives_send_buffer_pressure() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1088,7 +1088,7 @@ async fn unreachable_target_closes_client_connection() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, dead_target, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, dead_target, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1155,7 +1155,7 @@ async fn credit_suppressed_still_completes_via_probe() {
 
     let srv_cfg = cfg.clone();
     tokio::spawn(async move {
-        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity).await;
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 

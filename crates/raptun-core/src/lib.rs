@@ -27,12 +27,14 @@
 pub mod config;
 pub mod endpoint;
 pub mod fec;
+pub mod monitor;
 pub mod run;
 pub mod session;
 pub mod telemetry;
 pub mod tls;
 
 pub use config::{FecConfig, RuntimeConfig, TransportConfig};
+pub use monitor::{TunnelRegistry, TunnelStats};
 pub use run::{run_client, run_server, ListenMode};
 pub use session::{Role, Session};
 
