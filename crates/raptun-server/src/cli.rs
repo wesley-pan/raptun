@@ -155,6 +155,21 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
+
+    // ---- Monitor ---------------------------------------------------------
+    /// Run the interactive CLI monitor (top-like live view of active tunnels).
+    /// Takes over the terminal; logs are redirected to a file (see
+    /// `--monitor-log`) so they don't corrupt the display.
+    #[arg(long, default_value_t = false)]
+    pub monitor: bool,
+
+    /// Monitor refresh interval, milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub monitor_interval: u64,
+
+    /// File to redirect logs to while the monitor is running.
+    #[arg(long, default_value = "raptun-server.monitor.log")]
+    pub monitor_log: String,
 }
 
 /// File-backed configuration, mirroring the TOML in `raptun-server.example.toml`.
@@ -176,6 +191,9 @@ pub struct FileConfig {
     pub pprof: Option<String>,
     pub log_level: Option<String>,
     pub quiet: Option<bool>,
+    pub monitor: Option<bool>,
+    pub monitor_interval: Option<u64>,
+    pub monitor_log: Option<String>,
     pub max_conns: Option<u32>,
     #[serde(default)]
     pub fec: FileFec,
@@ -306,6 +324,21 @@ impl Cli {
         if from_default("quiet") {
             if let Some(v) = file.quiet {
                 self.quiet = v;
+            }
+        }
+        if from_default("monitor") {
+            if let Some(v) = file.monitor {
+                self.monitor = v;
+            }
+        }
+        if from_default("monitor_interval") {
+            if let Some(v) = file.monitor_interval {
+                self.monitor_interval = v;
+            }
+        }
+        if from_default("monitor_log") {
+            if let Some(v) = file.monitor_log {
+                self.monitor_log = v;
             }
         }
         if from_default("max_conns") {
