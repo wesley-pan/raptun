@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::RuntimeConfig;
 use crate::endpoint::{build_client_endpoint, build_server_endpoint, build_transport};
 use crate::fec::{DatagramHub, FecReceiver, FecSender};
+use crate::monitor::{TunnelRegistry, TunnelStats};
 use crate::session::{handshake_client, handshake_server, tunnel_bi};
 use crate::tls::{ServerIdentity, ServerTrust};
 use crate::{CoreError, Result};
@@ -287,6 +288,7 @@ pub async fn run_server(
     bind: SocketAddr,
     target: SocketAddr,
     identity: ServerIdentity,
+    registry: Option<Arc<TunnelRegistry>>,
 ) -> Result<()> {
     tracing::info!(fingerprint = %identity.fingerprint_hex, "pin this fingerprint on clients");
 
@@ -296,8 +298,9 @@ pub async fn run_server(
 
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_server_conn(incoming, config, target).await {
+            if let Err(e) = handle_server_conn(incoming, config, target, registry).await {
                 tracing::warn!(error = %e, "server connection closed with error");
             }
         });
@@ -317,6 +320,7 @@ async fn handle_server_conn(
     incoming: quinn::Incoming,
     config: RuntimeConfig,
     target: SocketAddr,
+    registry: Option<Arc<TunnelRegistry>>,
 ) -> Result<()> {
     let conn = incoming
         .await
@@ -358,6 +362,7 @@ async fn handle_server_conn(
         let fec = fec.clone();
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
+        let registry = registry.clone();
         tokio::spawn(async move {
             // Bound the target connect: an unreachable target must not park this
             // tunnel on the OS default timeout while its QUIC stream stays open.
@@ -365,8 +370,19 @@ async fn handle_server_conn(
             match connect {
                 Ok(Ok(tcp)) => {
                     let res = if use_fec {
-                        server_tunnel_fec(&conn, &hub, &fec, &budget, &send_window, tcp, send, recv)
-                            .await
+                        server_tunnel_fec(
+                            &conn,
+                            &hub,
+                            &fec,
+                            &budget,
+                            &send_window,
+                            tcp,
+                            send,
+                            recv,
+                            registry,
+                            remote,
+                        )
+                        .await
                     } else {
                         tunnel_bi(tcp, send, recv).await
                     };
@@ -574,6 +590,8 @@ async fn client_tunnel_fec(
         sig_send,
         sig_recv,
         inbound,
+        // The client does not run the monitor; server-only feature.
+        None,
     )
     .await;
     hub.unregister(stream_id);
@@ -584,7 +602,7 @@ async fn client_tunnel_fec(
 /// register the route, then pump TCP data both ways.
 #[allow(clippy::too_many_arguments)]
 async fn server_tunnel_fec(
-    conn: &quinn::Connection,
+    conn: &Arc<quinn::Connection>,
     hub: &DatagramHub,
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
@@ -592,6 +610,8 @@ async fn server_tunnel_fec(
     tcp: TcpStream,
     sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
+    registry: Option<Arc<TunnelRegistry>>,
+    remote: SocketAddr,
 ) -> Result<()> {
     let mut id_buf = [0u8; 8];
     sig_recv
@@ -602,6 +622,20 @@ async fn server_tunnel_fec(
 
     let inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "server FEC tunnel opened");
+
+    // Publish live stats for the monitor UI, if enabled. The guard removes the
+    // entry when this tunnel ends on any path; `stats` is the shared handle the
+    // data loops accumulate into. When monitoring is off, both are `None` and
+    // no counters are ever allocated or touched.
+    let (stats, _reg_guard) = match &registry {
+        Some(reg) => {
+            let stats = Arc::new(TunnelStats::new(remote, stream_id, conn, resolve_k(fec)));
+            let guard = reg.register((conn.stable_id(), stream_id), Arc::clone(&stats));
+            (Some(stats), Some(guard))
+        }
+        None => (None, None),
+    };
+
     let res = run_fec_tunnel(
         conn,
         fec,
@@ -612,6 +646,7 @@ async fn server_tunnel_fec(
         sig_send,
         sig_recv,
         inbound,
+        stats,
     )
     .await;
     hub.unregister(stream_id);
@@ -649,6 +684,9 @@ async fn run_fec_tunnel(
     sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
     inbound: tokio::sync::mpsc::UnboundedReceiver<crate::fec::InboundSymbol>,
+    // Live stats sink for the server monitor UI; `None` on the client and
+    // whenever monitoring is off, in which case the data loops touch nothing.
+    stats: Option<Arc<TunnelStats>>,
 ) -> Result<()> {
     use crate::fec::TunnelSignal;
     use tokio::sync::mpsc;
@@ -770,6 +808,7 @@ async fn run_fec_tunnel(
     let up_conn = conn.clone();
     let up_sig = sig_tx.clone();
     let up_window = Arc::clone(send_window);
+    let up_stats = stats.clone();
     let up = async move {
         let mut down_done_rx = down_done_rx;
         let mut sender = FecSender::new(stream_id, symbol_size, k);
@@ -810,6 +849,9 @@ async fn run_fec_tunnel(
                         eof = true;
                         continue;
                     }
+                    if let Some(s) = &up_stats {
+                        s.add_bytes_up(n as u64);
+                    }
                     // Flush each read burst immediately as one or more blocks;
                     // buffering until a full block forms would stall interactive
                     // traffic whose messages are far smaller than a block.
@@ -834,6 +876,9 @@ async fn run_fec_tunnel(
                                             delivered = delivered.max(d);
                                             up_window.settle(newly);
                                             credit_fresh = true;
+                                            if let Some(s) = &up_stats {
+                                                s.set_delivered(delivered);
+                                            }
                                         }
                                         None => break, // credit channel closed; stop gating
                                     }
@@ -854,6 +899,9 @@ async fn run_fec_tunnel(
                             send_datagram_paced(&up_conn, dg).await;
                         }
                         total_blocks += 1;
+                        if let Some(s) = &up_stats {
+                            s.record_block(repair);
+                        }
                     }
                     // Announce the running high-water mark on the reliable stream
                     // so the receiver learns these blocks exist even if every one
@@ -868,6 +916,9 @@ async fn run_fec_tunnel(
                 Some((block, need)) = nack_rx.recv() => {
                     for dg in sender.additional_repair(block, need) {
                         send_datagram_paced(&up_conn, dg).await;
+                    }
+                    if let Some(s) = &up_stats {
+                        s.add_repair(need);
                     }
                 }
                 // Serve a reliable-retransmit request: ship the block's bytes
@@ -884,6 +935,9 @@ async fn run_fec_tunnel(
                     delivered = delivered.max(d);
                     up_window.settle(newly);
                     credit_fresh = true;
+                    if let Some(s) = &up_stats {
+                        s.set_delivered(delivered);
+                    }
                 }
                 // A block was decoded on the receiver: release its retained
                 // encoder/payload now rather than waiting for the byte
@@ -985,6 +1039,7 @@ async fn run_fec_tunnel(
     let down_window = Arc::clone(send_window);
     let down_conn = conn.clone();
     let down_sig = sig_tx.clone();
+    let down_stats = stats.clone();
     let mut classifier = crate::telemetry::RegimeClassifier::new();
     let mut loss_tracker = crate::telemetry::LossTracker::new();
     let down = async move {
@@ -1010,6 +1065,9 @@ async fn run_fec_tunnel(
                         Some((block_id, esi, payload)) => {
                             let out = receiver.on_symbol(block_id, esi, &payload, Instant::now(), &budget);
                             if !out.is_empty() {
+                                if let Some(s) = &down_stats {
+                                    s.add_bytes_down(out.len() as u64);
+                                }
                                 tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
                             }
                             // A block may have decoded from this symbol:
@@ -1040,6 +1098,9 @@ async fn run_fec_tunnel(
                 Some((block, bytes)) = rel_data_rx.recv() => {
                     let out = receiver.on_reliable_block(block, bytes);
                     if !out.is_empty() {
+                        if let Some(s) = &down_stats {
+                            s.add_bytes_down(out.len() as u64);
+                        }
                         tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
                     }
                     // A reliably-completed block is also done: ack it

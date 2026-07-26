@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         "raptun-server starting"
     );
 
-    raptun_core::run_server(config, bind, target, identity).await?;
+    raptun_core::run_server(config, bind, target, identity, None).await?;
     Ok(())
 }
 
