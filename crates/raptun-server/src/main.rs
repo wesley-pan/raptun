@@ -4,19 +4,25 @@
 //! server accept/forward loop.
 
 mod cli;
+mod monitor_ui;
 
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::Cli;
 use raptun_core::tls::ServerIdentity;
+use raptun_core::TunnelRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let matches = Cli::command().get_matches();
     let mut args = Cli::from_arg_matches(&matches)?;
     args.merge_file(&matches)?;
-    init_tracing(&args.log_level, args.quiet);
+    // In monitor mode the TUI owns stdout, so logs go to a file to avoid
+    // corrupting the display; otherwise tracing writes to stdout as before.
+    init_tracing(&args.log_level, args.quiet, args.monitor, &args.monitor_log);
 
     let config = args.to_runtime_config();
 
@@ -65,15 +71,55 @@ async fn main() -> anyhow::Result<()> {
         "raptun-server starting"
     );
 
+    // With --monitor, publish a tunnel registry, run the server in the
+    // background, and drive the TUI on a blocking thread (crossterm's event
+    // reads block). Quitting the monitor ends the process.
+    if args.monitor {
+        let registry = TunnelRegistry::new();
+        let ui_registry = Arc::clone(&registry);
+        let interval = Duration::from_millis(args.monitor_interval.max(100));
+        tokio::spawn(async move {
+            if let Err(e) =
+                raptun_core::run_server(config, bind, target, identity, Some(registry)).await
+            {
+                tracing::error!(error = %e, "server loop exited");
+            }
+        });
+        tokio::task::spawn_blocking(move || monitor_ui::run(ui_registry, interval)).await??;
+        return Ok(());
+    }
+
     raptun_core::run_server(config, bind, target, identity, None).await?;
     Ok(())
 }
 
-fn init_tracing(level: &str, quiet: bool) {
+fn init_tracing(level: &str, quiet: bool, monitor: bool, monitor_log: &str) {
     if quiet {
         return;
     }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    // In monitor mode redirect logs to a file so they don't tear the TUI; a
+    // Mutex<File> is a MakeWriter. If the file can't be opened, fall back to
+    // stdout (better a scrambled display than silently losing all logs).
+    if monitor {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(monitor_log)
+        {
+            Ok(file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .init();
+                return;
+            }
+            Err(e) => {
+                eprintln!("could not open monitor log {monitor_log}: {e}; logging to stdout");
+            }
+        }
+    }
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
