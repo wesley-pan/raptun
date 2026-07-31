@@ -38,6 +38,14 @@ const HISTORY_LEN: usize = 60;
 /// lower = smoother. 0.4 tracks bursts without the number jittering every tick.
 const RATE_ALPHA: f64 = 0.4;
 
+/// A tunnel is considered "idle" when its application-byte counters have not
+/// advanced for this long. Idle tunnels are folded into a single summary row
+/// per connection so a connection holding many keep-alives doesn't fill the
+/// screen with 0 B/s rows. 3× the default refresh interval: short enough to
+/// keep the active view clean, long enough that brief request/response gaps
+/// don't get collapsed.
+const IDLE_AFTER: Duration = Duration::from_secs(3);
+
 /// Unicode block-elements for the inline sparkline, low to high.
 const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -78,6 +86,9 @@ struct TunnelHistory {
     up_rate: f64,   // bytes/s, EWMA-smoothed
     down_rate: f64, // bytes/s, EWMA-smoothed
     down_hist: VecDeque<u64>,
+    /// When both byte counters last advanced. `None` = active this tick,
+    /// `Some(t)` = idle since `t`. A fresh data sample resets it to `None`.
+    idle_since: Option<Instant>,
 }
 
 /// Per-connection windowed loss, sampled once per connection per tick (all
@@ -89,9 +100,11 @@ struct ConnHistory {
     loss_pct: f64,
 }
 
-/// One rendered row: either a connection (group) header or a tunnel under it.
+/// One rendered row: either a connection (group) header, a live tunnel under
+/// it, or a folded summary of the group's idle keep-alive tunnels.
 struct RowData {
     is_group: bool,
+    is_idle_fold: bool,
     remote: String,
     rtt_ms: Option<u64>,
     loss_pct: Option<f64>,
@@ -241,10 +254,14 @@ fn sample(
             loss_pct = Some(ch.loss_pct);
         }
 
-        // Per-tunnel rows + group aggregate.
+        // Per-tunnel rows + group aggregate. Two passes: first collect raw
+        // instantaneous rates so we can normalise the sparkline across the
+        // group (otherwise one stream's old burst dominates the visual);
+        // then build the rows.
         let mut g_up = 0.0;
         let mut g_down = 0.0;
-        let mut child_rows = Vec::new();
+        let mut child_rows: Vec<RowData> = Vec::new();
+        let mut max_inst_down: f64 = 0.0;
         for st in members {
             let id = (
                 st.connection().map(|c| c.stable_id()).unwrap_or(0),
@@ -257,11 +274,21 @@ fn sample(
             let inst_down = bd.saturating_sub(h.last_bytes_down) as f64 / dt;
             h.last_bytes_up = bu;
             h.last_bytes_down = bd;
+            // Reset the idle clock on any fresh traffic; otherwise stamp now
+            // so the fold row can show how long this stream has been quiet.
+            if bu != h.last_bytes_up || bd != h.last_bytes_down {
+                h.idle_since = None;
+            } else if h.idle_since.is_none() {
+                h.idle_since = Some(Instant::now());
+            }
             h.up_rate = ewma(h.up_rate, inst_up);
             h.down_rate = ewma(h.down_rate, inst_down);
             h.down_hist.push_back(inst_down as u64);
             while h.down_hist.len() > HISTORY_LEN {
                 h.down_hist.pop_front();
+            }
+            if inst_down > max_inst_down {
+                max_inst_down = inst_down;
             }
             g_up += h.up_rate;
             g_down += h.down_rate;
@@ -274,12 +301,13 @@ fn sample(
             let repair = st.repair_symbols.load(std::sync::atomic::Ordering::Relaxed);
             child_rows.push(RowData {
                 is_group: false,
+                is_idle_fold: false,
                 remote: format!("  ├ stream {}", st.stream_id),
                 rtt_ms: None,
                 loss_pct: None,
                 up_rate: h.up_rate,
                 down_rate: h.down_rate,
-                spark: sparkline(&h.down_hist),
+                spark: String::new(), // filled in after group-max is known
                 fec_overhead: repair as f64 / source as f64,
                 age: st.started_at.elapsed(),
                 delivered,
@@ -288,11 +316,53 @@ fn sample(
             });
         }
 
-        // Sort children within the group by the active key.
-        sort_rows(&mut child_rows, sort);
+        // Split children: active ones get a row, idle ones are folded. The
+        // cutoff is IDLE_AFTER so a brief request/response gap doesn't fold a
+        // still-busy stream. After IDLE_AFTER the EWMA rate is dominated by
+        // the floor (≈0), so they look the same to the user.
+        let now = Instant::now();
+        let mut active: Vec<RowData> = Vec::new();
+        let mut idle_count: usize = 0;
+        let mut idle_oldest = Duration::ZERO;
+        for (row, st) in child_rows.into_iter().zip(members.iter()) {
+            let id = (
+                st.connection().map(|c| c.stable_id()).unwrap_or(0),
+                st.stream_id,
+            );
+            let idle_dur = tunnels
+                .get(&id)
+                .and_then(|h| h.idle_since)
+                .map(|t| now.saturating_duration_since(t));
+            let is_idle = idle_dur.is_some_and(|d| d >= IDLE_AFTER);
+            if is_idle {
+                idle_count += 1;
+                if let Some(d) = idle_dur {
+                    // `oldest` here is the *idle duration* of the most-idle
+                    // member; from the user's perspective this reads as
+                    // "the longest quiet one has been quiet for X".
+                    if d > idle_oldest {
+                        idle_oldest = d;
+                    }
+                }
+            } else {
+                let mut r = row;
+                r.spark = sparkline_with_max(
+                    tunnels
+                        .get(&id)
+                        .map(|h| &h.down_hist)
+                        .unwrap_or(&VecDeque::new()),
+                    max_inst_down,
+                );
+                active.push(r);
+            }
+        }
+
+        // Sort active children within the group by the active key.
+        sort_rows(&mut active, sort);
 
         rows.push(RowData {
             is_group: true,
+            is_idle_fold: false,
             remote,
             rtt_ms,
             loss_pct,
@@ -305,7 +375,24 @@ fn sample(
             total: 0,
             lagging: false,
         });
-        rows.extend(child_rows);
+        rows.extend(active);
+        if idle_count > 0 {
+            rows.push(RowData {
+                is_idle_fold: true,
+                is_group: false,
+                remote: format!("  └ idle ({idle_count} stream{}", if idle_count == 1 { "" } else { "s" }),
+                rtt_ms: None,
+                loss_pct: None,
+                up_rate: 0.0,
+                down_rate: 0.0,
+                spark: String::new(),
+                fec_overhead: 0.0,
+                age: idle_oldest,
+                delivered: 0,
+                total: 0,
+                lagging: false,
+            });
+        }
     }
     rows
 }
@@ -326,20 +413,19 @@ fn ewma(prev: f64, sample: f64) -> f64 {
     }
 }
 
-/// Render a history buffer as inline block-element sparkline characters.
-fn sparkline(hist: &VecDeque<u64>) -> String {
-    if hist.is_empty() {
+/// Render a history buffer as inline block-element sparkline characters,
+/// normalised against `group_max` (not the buffer's own max). With per-stream
+/// normalisation, a stream whose only sample was a tiny burst early on would
+/// fill its bar to the top — making every idle keep-alive look active. Using
+/// the group's max keeps the visual scale honest: the noisiest stream in the
+/// group fills the bar, quieter ones scale relative to it.
+fn sparkline_with_max(hist: &VecDeque<u64>, group_max: f64) -> String {
+    if hist.is_empty() || group_max <= 0.0 {
         return String::new();
-    }
-    let max = *hist.iter().max().unwrap_or(&0);
-    if max == 0 {
-        return SPARK_BLOCKS[0]
-            .to_string()
-            .repeat(hist.len().min(HISTORY_LEN));
     }
     hist.iter()
         .map(|&v| {
-            let idx = ((v as f64 / max as f64) * (SPARK_BLOCKS.len() - 1) as f64).round() as usize;
+            let idx = ((v as f64 / group_max) * (SPARK_BLOCKS.len() - 1) as f64).round() as usize;
             SPARK_BLOCKS[idx.min(SPARK_BLOCKS.len() - 1)]
         })
         .collect()
@@ -381,14 +467,20 @@ fn draw(
 
         // --- Header line.
         let conns = rows.iter().filter(|r| r.is_group).count();
-        let tunnels = rows.iter().filter(|r| !r.is_group).count();
+        let active = rows.iter().filter(|r| !r.is_group && !r.is_idle_fold).count();
+        let idle_groups = rows.iter().filter(|r| r.is_idle_fold).count();
+        let idle_suffix = if idle_groups > 0 {
+            format!(" ({idle_groups} idle groups)")
+        } else {
+            String::new()
+        };
         let header = Line::from(vec![
             Span::styled(
                 "raptun-server monitor",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "   up {}   conns {conns}   tunnels {tunnels}   sort:{}{}",
+                "   up {}   conns {conns}   active {active}{idle_suffix}   sort:{}{}",
                 fmt_age(uptime),
                 sort.label(),
                 if frozen { "   [FROZEN]" } else { "" },
@@ -463,6 +555,22 @@ fn render_row(r: &RowData) -> Row<'static> {
             Cell::from(""),
         ])
         .style(style)
+    } else if r.is_idle_fold {
+        // One summary row for the group's idle keep-alive tunnels. The age
+        // column shows how long the longest-quiet one has been quiet; the
+        // other columns are zero. A muted colour so it doesn't visually
+        // compete with live traffic.
+        Row::new(vec![
+            Cell::from(r.remote.clone()).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(fmt_age(r.age)).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+        ])
     } else {
         let blk_style = if r.lagging {
             Style::default().fg(Color::Yellow)
