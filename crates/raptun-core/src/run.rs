@@ -772,30 +772,43 @@ async fn run_fec_tunnel(
                 Ok(None) => break false, // peer finished the stream cleanly
                 Err(_) => break true,    // peer reset / read error
             }
-            // Drain as many complete signals as the buffer holds.
-            while let Some((sig, used)) = TunnelSignal::decode(&buf) {
-                buf.drain(..used);
-                match sig {
-                    TunnelSignal::BlockCount { total } => {
-                        let _ = count_tx.send(total);
+            // Drain as many complete signals as the buffer holds. A decode
+            // failure (unknown tag byte, version skew, framing corruption)
+            // returns `Err(n)` so we can drop the bad bytes and keep going
+            // instead of deadlocking the buffer; previously an unknown tag
+            // synthesised a BlockCount{total: u64::MAX} which permanently
+            // hung the downstream task.
+            while let Some(outcome) = TunnelSignal::decode(&buf) {
+                match outcome {
+                    Ok((sig, used)) => {
+                        buf.drain(..used);
+                        match sig {
+                            TunnelSignal::BlockCount { total } => {
+                                let _ = count_tx.send(total);
+                            }
+                            TunnelSignal::HighWater { blocks } => {
+                                let _ = hw_tx.send(blocks);
+                            }
+                            TunnelSignal::Nack { block, need, .. } => {
+                                let _ = nack_tx.send((block, need));
+                            }
+                            TunnelSignal::ReliableRequest { block } => {
+                                let _ = rel_req_tx.send(block);
+                            }
+                            TunnelSignal::ReliableData { block, bytes } => {
+                                let _ = rel_data_tx.send((block, bytes));
+                            }
+                            TunnelSignal::Credit { delivered } => {
+                                let _ = credit_tx.send(delivered);
+                            }
+                            TunnelSignal::BlockAck { block } => {
+                                let _ = ack_tx.send(block);
+                            }
+                        }
                     }
-                    TunnelSignal::HighWater { blocks } => {
-                        let _ = hw_tx.send(blocks);
-                    }
-                    TunnelSignal::Nack { block, need, .. } => {
-                        let _ = nack_tx.send((block, need));
-                    }
-                    TunnelSignal::ReliableRequest { block } => {
-                        let _ = rel_req_tx.send(block);
-                    }
-                    TunnelSignal::ReliableData { block, bytes } => {
-                        let _ = rel_data_tx.send((block, bytes));
-                    }
-                    TunnelSignal::Credit { delivered } => {
-                        let _ = credit_tx.send(delivered);
-                    }
-                    TunnelSignal::BlockAck { block } => {
-                        let _ = ack_tx.send(block);
+                    Err(skipped) => {
+                        tracing::warn!(skipped, "unknown tag on signaling stream: resynced");
+                        buf.drain(..skipped);
                     }
                 }
             }
