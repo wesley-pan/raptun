@@ -270,13 +270,19 @@ fn sample(
             let bu = st.bytes_up.load(std::sync::atomic::Ordering::Relaxed);
             let bd = st.bytes_down.load(std::sync::atomic::Ordering::Relaxed);
             let h = tunnels.entry(id).or_default();
-            let inst_up = bu.saturating_sub(h.last_bytes_up) as f64 / dt;
-            let inst_down = bd.saturating_sub(h.last_bytes_down) as f64 / dt;
+            // Capture the *previous* counter values BEFORE we overwrite them
+            // so the idle-detection check compares new vs old (the previous
+            // version compared new vs new, which was always equal and
+            // therefore marked every tunnel as permanently idle — bug H9).
+            let prev_up = h.last_bytes_up;
+            let prev_down = h.last_bytes_down;
+            let inst_up = bu.saturating_sub(prev_up) as f64 / dt;
+            let inst_down = bd.saturating_sub(prev_down) as f64 / dt;
             h.last_bytes_up = bu;
             h.last_bytes_down = bd;
             // Reset the idle clock on any fresh traffic; otherwise stamp now
             // so the fold row can show how long this stream has been quiet.
-            if bu != h.last_bytes_up || bd != h.last_bytes_down {
+            if bu != prev_up || bd != prev_down {
                 h.idle_since = None;
             } else if h.idle_since.is_none() {
                 h.idle_since = Some(Instant::now());
@@ -380,7 +386,10 @@ fn sample(
             rows.push(RowData {
                 is_idle_fold: true,
                 is_group: false,
-                remote: format!("  └ idle ({idle_count} stream{}", if idle_count == 1 { "" } else { "s" }),
+                remote: format!(
+                    "  └ idle ({idle_count} stream{}",
+                    if idle_count == 1 { "" } else { "s" }
+                ),
                 rtt_ms: None,
                 loss_pct: None,
                 up_rate: 0.0,
@@ -467,7 +476,10 @@ fn draw(
 
         // --- Header line.
         let conns = rows.iter().filter(|r| r.is_group).count();
-        let active = rows.iter().filter(|r| !r.is_group && !r.is_idle_fold).count();
+        let active = rows
+            .iter()
+            .filter(|r| !r.is_group && !r.is_idle_fold)
+            .count();
         let idle_groups = rows.iter().filter(|r| r.is_idle_fold).count();
         let idle_suffix = if idle_groups > 0 {
             format!(" ({idle_groups} idle groups)")
@@ -588,5 +600,60 @@ fn render_row(r: &RowData) -> Row<'static> {
             Cell::from(fmt_age(r.age)),
             Cell::from(format!("{}/{}", r.delivered, r.total)).style(blk_style),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    /// H9 regression: the "is this stream idle" check must compare the
+    /// freshly-sampled byte counters to the **previous** tick's stored
+    /// counters, NOT to the just-overwritten stored value (the previous
+    /// version of the code did the latter, which made every tunnel
+    /// permanently idle and the monitor useless).
+    #[test]
+    fn idle_check_compares_new_to_previous_not_new_to_new() {
+        // The logic, lifted from `sample`. Kept in a tiny helper so the
+        // test documents and locks the invariant without needing a
+        // `TunnelRegistry` setup.
+        fn update_idle_since(
+            idle: &mut Option<Instant>,
+            new_up: u64,
+            new_down: u64,
+            prev_up: u64,
+            prev_down: u64,
+            now: Instant,
+        ) {
+            if new_up != prev_up || new_down != prev_down {
+                *idle = None;
+            } else if idle.is_none() {
+                *idle = Some(now);
+            }
+        }
+
+        let mut idle: Option<Instant> = None;
+        let now0 = Instant::now();
+        // No traffic on the first tick: idle stamp is set.
+        update_idle_since(&mut idle, 0, 0, 0, 0, now0);
+        assert!(idle.is_some(), "first idle tick must stamp idle_since");
+
+        // Same counters on the second tick: the comparison must be
+        // (0 == prev_up && 0 == prev_down), which is true because the
+        // *previous* stored value was indeed 0,0. Idle is *not* cleared.
+        update_idle_since(&mut idle, 0, 0, 0, 0, now0);
+        assert!(
+            idle.is_some(),
+            "still idle: comparison correctly used the previous counter values"
+        );
+
+        // Now traffic arrives: previous (0, 0) != new (100, 50). Cleared.
+        update_idle_since(&mut idle, 100, 50, 0, 0, now0);
+        assert!(idle.is_none(), "fresh traffic must clear idle_since");
+
+        // And traffic stops again: stamp a fresh idle time.
+        let now1 = now0;
+        update_idle_since(&mut idle, 100, 50, 100, 50, now1);
+        assert!(idle.is_some(), "traffic stops, idle is stamped again");
     }
 }

@@ -995,6 +995,13 @@ async fn run_fec_tunnel(
         let _ = up_sig.send(TunnelSignal::BlockCount {
             total: total_blocks,
         });
+        // Reset the stall clock for the post-EOF phase. Pre-EOF progress was
+        // measured by `delivered` advancing; post-EOF the receiver may still be
+        // decoding the last few blocks (measured by BlockAcks, below), so a
+        // fresh clock is needed — otherwise a long-idle-but-caught-up tunnel
+        // that just reached EOF would be killed by the very first post-EOF
+        // tick (H4).
+        last_progress_at = Instant::now();
         loop {
             tokio::select! {
                 Some((block, need)) = nack_rx.recv() => {
