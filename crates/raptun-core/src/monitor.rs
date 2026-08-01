@@ -157,7 +157,7 @@ impl TunnelRegistry {
     /// drop. The guard holds an `Arc<Self>`, so the registry outlives every
     /// tunnel it tracks.
     pub fn register(self: &Arc<Self>, id: TunnelId, stats: Arc<TunnelStats>) -> RegistryGuard {
-        self.inner.write().unwrap().insert(id, stats);
+        self.write_lock().insert(id, stats);
         RegistryGuard {
             registry: Arc::clone(self),
             id,
@@ -167,21 +167,47 @@ impl TunnelRegistry {
     /// A point-in-time copy of every live tunnel's stats handle, for the UI to
     /// read without holding the lock while it renders.
     pub fn snapshot(&self) -> Vec<Arc<TunnelStats>> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.read_lock().values().cloned().collect()
     }
 
     /// Number of live tunnels.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.read_lock().len()
     }
 
     /// Whether any tunnels are live.
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        self.read_lock().is_empty()
     }
 
     fn remove(&self, id: &TunnelId) {
-        self.inner.write().unwrap().remove(id);
+        self.write_lock().remove(id);
+    }
+
+    // Recover from a poisoned lock instead of panicking the registry. A
+    // poisoning is rare (a panic in a writer while holding the lock), but
+    // the registry is a UI observation point — killing the server over a
+    // stale read/write is strictly worse than logging and continuing with
+    // an empty or partially-empty map. The data inside is independent
+    // (TunnelStats atomics + IDs), so `into_inner()` on a poisoned lock
+    // is safe: we get the same HashMap back.
+    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, HashMap<TunnelId, Arc<TunnelStats>>> {
+        match self.inner.read() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("TunnelRegistry read lock poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<TunnelId, Arc<TunnelStats>>> {
+        match self.inner.write() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("TunnelRegistry write lock poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -196,5 +222,53 @@ pub struct RegistryGuard {
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LOW-1 smoke: a freshly-created registry is empty. The end-to-end
+    /// register() path requires a quinn::Connection, covered in
+    /// `tests/critical_dos.rs`; here we just guard the structural
+    /// invariant (initial state is consistent).
+    #[test]
+    fn fresh_registry_is_empty() {
+        let reg = TunnelRegistry::new();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+        assert_eq!(reg.snapshot().len(), 0);
+    }
+
+    /// LOW-1 regression: a poisoned registry lock is recovered, not
+    /// panicked. We test the recovery shape directly: poison a lock by
+    /// panicking while holding a write, then read via the same
+    /// `read_lock` / `write_lock` pattern the registry uses and confirm
+    /// `into_inner()` returns the inner data.
+    #[test]
+    fn poisoned_lock_is_recovered() {
+        use std::sync::{Arc, RwLock};
+
+        let lock: Arc<RwLock<u32>> = Arc::new(RwLock::new(0));
+        {
+            let lock_for_panic = Arc::clone(&lock);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut g = lock_for_panic.write().unwrap();
+                *g = 1;
+                panic!("poison the lock");
+            }));
+        }
+        // The lock is now poisoned. `read()` returns Err; `into_inner()`
+        // on the PoisonError yields the inner guard — the same pattern
+        // used in `TunnelRegistry::read_lock` / `write_lock`.
+        let res = lock.read();
+        match res {
+            Ok(_) => panic!("expected poison"),
+            Err(poisoned) => {
+                let g = poisoned.into_inner();
+                assert_eq!(*g, 1, "into_inner() yields the value written before panic");
+            }
+        }
     }
 }

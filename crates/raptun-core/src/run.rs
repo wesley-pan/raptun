@@ -153,16 +153,30 @@ async fn serve_connection(
         spawn_client_heartbeat(Arc::clone(&conn), Arc::clone(&active), interval);
     }
 
+    // M2: collect every per-tunnel task into a JoinSet so we can abort them
+    // all when the connection scope ends. `JoinSet::Drop` aborts every still-
+    // running task, so the right-shutdown semantics are "live tunnels die
+    // when the QUIC connection dies", with no orphans left for the rest of
+    // the process. `join_next` reaps finished tasks without blocking.
+    let mut tunnels: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
         // Race accepting a local connection against the QUIC connection closing,
         // so a server that goes away while we are idle triggers a reconnect
-        // instead of leaving us blocked in `accept()`.
+        // instead of leaving us blocked in `accept()`. The third arm reaps
+        // finished per-tunnel tasks so the set doesn't grow without bound
+        // over a long-lived connection.
         let (tcp, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             closed = conn.closed() => {
                 tracing::debug!(reason = %closed, "quic connection closed while idle");
                 return Ok(());
             }
+            // A per-tunnel task finished; ignore its JoinError (panic or
+            // external abort). `continue` restarts the loop so we re-poll
+            // the select — the joint set is now smaller and a future
+            // accept is more likely to win the race.
+            Some(_result) = tunnels.join_next(), if !tunnels.is_empty() => continue,
         };
         tracing::debug!(%peer, "accepted local connection");
         let conn = Arc::clone(&conn);
@@ -171,7 +185,7 @@ async fn serve_connection(
         let active = Arc::clone(&active);
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
-        tokio::spawn(async move {
+        tunnels.spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
             active.fetch_add(1, Ordering::Relaxed);
@@ -417,13 +431,29 @@ async fn handle_server_conn(
     let budget = new_conn_budget(&conn, &fec, &config);
     let send_window = new_conn_send_window(&conn, &fec);
 
+    // M2: same JoinSet pattern as the client. When the connection scope ends
+    // (conn closes, accept_bi errors, etc.), the JoinSet's Drop aborts every
+    // still-running per-tunnel task, so we never leave orphaned tunnels around
+    // for the rest of the process to clean up.
+    let mut tunnels: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::debug!(%remote, error = %e, "connection ended");
-                return Ok(());
-            }
+        // Race accept_bi against finished-tunnel reaps. accept_bi's Err is
+        // the conn-close signal; that path also drops `tunnels` and aborts
+        // everything. The `Some` arm only fires when a tunnel completes.
+        let (mut send, mut recv) = tokio::select! {
+            accepted = conn.accept_bi() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!(%remote, error = %e, "connection ended");
+                    return Ok(());
+                }
+            },
+            // Tunnel finished: re-enter the select so a future accept wins.
+            // `tunnels.is_empty()` would yield `None` from `join_next` and
+            // panic on `Some(_result) =` pattern matching, so the `if` guard
+            // disables the arm when there's nothing to reap.
+            Some(_result) = tunnels.join_next(), if !tunnels.is_empty() => continue,
         };
         let conn = Arc::clone(&conn);
         let hub = hub.clone();
@@ -431,7 +461,7 @@ async fn handle_server_conn(
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
         let registry = registry.clone();
-        tokio::spawn(async move {
+        tunnels.spawn(async move {
             // Bound the target connect: an unreachable target must not park this
             // tunnel on the OS default timeout while its QUIC stream stays open.
             let connect = tokio::time::timeout(connect_timeout, TcpStream::connect(target)).await;
@@ -678,7 +708,7 @@ async fn server_tunnel_fec(
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
     tcp: TcpStream,
-    sig_send: quinn::SendStream,
+    mut sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
     registry: Option<Arc<TunnelRegistry>>,
     remote: SocketAddr,
@@ -689,6 +719,23 @@ async fn server_tunnel_fec(
         .await
         .map_err(|e| CoreError::Endpoint(format!("read stream id: {e}")))?;
     let stream_id = u64::from_be_bytes(id_buf);
+
+    // M3: refuse to overwrite an active route. A peer that re-uses a
+    // stream_id would otherwise overwrite the prior route, leaving the
+    // older tunnel's receiver silent (its sender is still in the routes
+    // map but the route points at a different channel). Reject and reset
+    // the stream so the client sees the failure cleanly.
+    if hub.has_route(stream_id) {
+        tracing::warn!(
+            stream_id,
+            %remote,
+            "duplicate stream_id on the control stream; resetting tunnel"
+        );
+        let _ = sig_send.reset(TARGET_UNREACHABLE_CODE);
+        return Err(CoreError::Endpoint(format!(
+            "duplicate stream_id {stream_id}"
+        )));
+    }
 
     // HubGuard unregisters on drop, including panic — see client_tunnel_fec.
     let mut inbound = hub.register(stream_id);
@@ -753,7 +800,7 @@ async fn run_fec_tunnel(
     tcp: TcpStream,
     sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
-    inbound: tokio::sync::mpsc::UnboundedReceiver<crate::fec::InboundSymbol>,
+    inbound: tokio::sync::mpsc::Receiver<crate::fec::InboundSymbol>,
     // Live stats sink for the server monitor UI; `None` on the client and
     // whenever monitoring is off, in which case the data loops touch nothing.
     stats: Option<Arc<TunnelStats>>,
@@ -1266,7 +1313,14 @@ async fn run_fec_tunnel(
     // and must NOT interrupt the data directions, which may still be flushing
     // the final bytes — in that case we fall through to awaiting them.
     let data = async {
-        let (up_r, down_r, _w) = tokio::join!(up, down, writer);
+        let (up_r, down_r, w_r) = tokio::join!(up, down, writer);
+        if let Err(e) = w_r {
+            // The signaling writer saw an error after H5. Log once at warn
+            // so it's not silently swallowed — the underlying cause is
+            // already in the writer's own warn line; this is a backstop
+            // for the case where data directions masked the failure.
+            tracing::warn!(error = %e, "signaling writer task returned error");
+        }
         up_r?;
         down_r?;
         Ok::<(), CoreError>(())
