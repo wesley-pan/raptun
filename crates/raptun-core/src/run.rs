@@ -199,6 +199,16 @@ async fn serve_connection(
 /// Whether a tunnel error is just the local peer closing its socket while we
 /// still had data to deliver — expected churn for browser/interactive traffic,
 /// not a fault worth a warning.
+///
+/// Covers the four typical "peer disappeared" kinds: `BrokenPipe` (write
+/// after peer closed), `ConnectionReset` / `ConnectionAborted` (TCP RST), and
+/// `UnexpectedEof` / `NotConnected` (peer closed cleanly while we still
+/// had data buffered). `NotConnected` shows up when the local socket was
+/// never fully connected (e.g. the local process killed the socket between
+/// `connect` and the first read) — also benign.
+///
+/// What this does NOT cover: `TimedOut`, `Interrupted`, or any non-I/O
+/// `CoreError` — those stay at warn level.
 fn is_benign_local_close(err: &CoreError) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -206,9 +216,67 @@ fn is_benign_local_close(err: &CoreError) -> bool {
         CoreError::Io(io)
             if matches!(
                 io.kind(),
-                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected
             )
     )
+}
+
+#[cfg(test)]
+mod close_classification_tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    fn io_err(kind: ErrorKind) -> CoreError {
+        CoreError::Io(IoError::from(kind))
+    }
+
+    /// H6 regression: the four typical "local peer closed the socket while
+    /// we still had data" kinds are all benign. Previously `UnexpectedEof`
+    /// and `NotConnected` were missing, so the same kind of behaviour
+    /// (browser tab close, client cancel before first read) was being
+    /// logged at warn.
+    #[test]
+    fn benign_local_close_covers_the_four_peer_gone_kinds() {
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(
+                is_benign_local_close(&io_err(kind)),
+                "{kind:?} must be classified as benign"
+            );
+        }
+    }
+
+    /// And the things that are NOT benign stay at warn level.
+    #[test]
+    fn benign_local_close_does_not_swallow_real_errors() {
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::PermissionDenied,
+            ErrorKind::OutOfMemory,
+        ] {
+            assert!(
+                !is_benign_local_close(&io_err(kind)),
+                "{kind:?} must NOT be classified as benign"
+            );
+        }
+    }
+
+    /// Non-I/O errors (e.g. protocol) are never benign.
+    #[test]
+    fn non_io_errors_are_never_benign() {
+        let proto = CoreError::Proto(raptun_proto::WireError::Truncated { needed: 0 });
+        assert!(!is_benign_local_close(&proto));
+    }
 }
 
 /// Decrements the active-tunnel counter when a tunnel task ends, on any path.
@@ -750,7 +818,16 @@ async fn run_fec_tunnel(
         let mut sig_send = sig_send;
         while let Some(sig) = sig_rx.recv().await {
             let bytes = sig.encode();
-            if sig_send.write_all(&bytes).await.is_err() {
+            if let Err(e) = sig_send.write_all(&bytes).await {
+                // Surface the cause: previously this was a bare `is_err() { break }`
+                // and the *only* signal in the log was the peer reset the
+                // reader observed later. Operators had no way to tell whether
+                // the channel failed because of back-pressure, a closed
+                // connection, or a framing error on our side (H5).
+                tracing::warn!(
+                    error = %e,
+                    "signaling writer failed; closing the channel"
+                );
                 break;
             }
         }
@@ -1280,6 +1357,15 @@ fn test_should_drop_credit() -> bool {
 /// Genuine on-wire loss (the case FEC exists to absorb) still happens in the
 /// network, where repair symbols recover it. `TooLarge`/`UnsupportedByPeer` and
 /// a lost connection are non-retryable and are simply logged and dropped.
+/// Process-wide throttle for `send_datagram_paced` errors. The function is
+/// called per-symbol, so a dying connection can produce thousands of errors
+/// per second. We log the first one at warn and then one-per-second until
+/// the storm stops; the dropped count is also recorded so the operator can
+/// tell the difference between a brief error and a sustained loss.
+static DATAGRAM_ERR_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static DATAGRAM_ERR_TOTAL: AtomicU64 = AtomicU64::new(0);
+const DATAGRAM_ERR_LOG_INTERVAL_MS: u64 = 1_000;
+
 async fn send_datagram_paced(conn: &quinn::Connection, dg: bytes::Bytes) {
     #[cfg(feature = "test-hooks")]
     {
@@ -1293,7 +1379,28 @@ async fn send_datagram_paced(conn: &quinn::Connection, dg: bytes::Bytes) {
         }
     }
     if let Err(e) = conn.send_datagram_wait(dg).await {
-        tracing::trace!(error = %e, "datagram dropped (FEC will absorb)");
+        DATAGRAM_ERR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        // Throttle so a flapping link doesn't flood the log; previously this
+        // was a `trace!` per error, which meant *no* operator signal in a
+        // production run with default `RUST_LOG=info` — yet a dying
+        // connection was flooding trace at thousands per second (H7).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = DATAGRAM_ERR_LAST_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) >= DATAGRAM_ERR_LOG_INTERVAL_MS
+            && DATAGRAM_ERR_LAST_MS
+                .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let total = DATAGRAM_ERR_TOTAL.load(Ordering::Relaxed);
+            tracing::warn!(
+                error = %e,
+                total_since_start = total,
+                "datagram send failed (rate-limited; link may be dead)"
+            );
+        }
     }
 }
 
