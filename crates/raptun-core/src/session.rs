@@ -211,6 +211,17 @@ pub async fn handshake_server(
     Ok((ctrl, clamped))
 }
 
+/// Upper bound on the per-block geometry K (`block_size`). A client may request
+/// any `u16` value here, but a single block is held in memory twice by the
+/// sender (encoder + raw payload) and the byte-budget retention cap
+/// (`SENDER_RETAIN_BYTES` in raptun-fec) only works when one block is much
+/// smaller than the cap. At the default 1200-byte symbol size, K=256 yields
+/// ~300 KB/block — well under the 4 MB retention cap so a handful of blocks
+/// can be retained; a hostile K=65535 (block ~78 MB) bypasses the cap entirely
+/// and the sender keeps a single ~156 MB allocation. Both ends always see the
+/// clamped value via the HelloAck echo, so clamping is safe and silent.
+const MAX_BLOCK_SIZE: u16 = 256;
+
 /// Clamp client-requested FEC params against server policy: symbol size must
 /// match the server's, and the repair ratio may not exceed the server ceiling.
 fn clamp_fec(requested: &FecParams, config: &RuntimeConfig) -> FecParams {
@@ -218,9 +229,14 @@ fn clamp_fec(requested: &FecParams, config: &RuntimeConfig) -> FecParams {
     // Symbol size is fixed by the server so both ends frame identically, and is
     // clamped to a size guaranteed to fit in one QUIC datagram.
     let symbol_size = config.fec.symbol_size.min(SAFE_MAX_SYMBOL_SIZE);
+    // Clamp block_size too: a client-requested u16 = 65535 forces the sender
+    // to allocate ~78 MB per block and the per-tunnel retention cap stops
+    // applying. Capped silently to MAX_BLOCK_SIZE (the HelloAck echoes the
+    // clamped value so both ends agree).
+    let block_size = requested.block_size.min(MAX_BLOCK_SIZE);
     FecParams {
         symbol_size,
-        block_size: requested.block_size,
+        block_size,
         repair_ppm: requested.repair_ppm.min(max_ppm),
     }
 }
@@ -455,6 +471,28 @@ mod tests {
         assert!(
             clamped.repair_ppm <= cfg.fec.strategy.max.as_ppm_thousandths(),
             "repair ratio clamped to ceiling"
+        );
+    }
+
+    #[test]
+    fn clamp_fec_caps_block_size_to_bounded_memory() {
+        // A hostile client can request block_size = u16::MAX, which without
+        // clamping forces a ~78 MB allocation per block on the sender. Verify
+        // the cap is enforced and the value is still well above the default.
+        let cfg = test_config(None);
+        let hostile = FecParams {
+            symbol_size: 1200,
+            block_size: u16::MAX,
+            repair_ppm: 100,
+        };
+        let clamped = clamp_fec(&hostile, &cfg);
+        assert_eq!(
+            clamped.block_size, MAX_BLOCK_SIZE,
+            "u16::MAX block_size must be clamped"
+        );
+        assert!(
+            clamped.block_size >= 16,
+            "clamp leaves headroom for normal use"
         );
     }
 }

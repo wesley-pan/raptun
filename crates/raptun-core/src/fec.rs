@@ -143,9 +143,16 @@ impl TunnelSignal {
         b
     }
 
-    /// Try to decode one message from the front of `buf`, returning the message
-    /// and the number of bytes consumed, or `None` if more bytes are needed.
-    pub fn decode(buf: &[u8]) -> Option<(TunnelSignal, usize)> {
+    /// Try to decode one message from the front of `buf`.
+    ///
+    /// Return values:
+    /// - `Some(Ok((sig, n)))` — decoded a signal, consume `n` bytes.
+    /// - `Some(Err(n))` — `n` bytes were unknown/garbage and have been
+    ///   consumed so the caller can advance past them. Used to recover from
+    ///   a version skew, malicious peer, or framing corruption.
+    /// - `None` — the buffer holds a *valid* tag whose payload is incomplete;
+    ///   caller must read more bytes before retrying.
+    pub fn decode(buf: &[u8]) -> Option<Result<(TunnelSignal, usize), usize>> {
         let tag = *buf.first()?;
         match tag {
             Self::TAG_BLOCK_COUNT => {
@@ -153,14 +160,14 @@ impl TunnelSignal {
                     return None;
                 }
                 let total = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-                Some((TunnelSignal::BlockCount { total }, 9))
+                Some(Ok((TunnelSignal::BlockCount { total }, 9)))
             }
             Self::TAG_HIGH_WATER => {
                 if buf.len() < 1 + 8 {
                     return None;
                 }
                 let blocks = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-                Some((TunnelSignal::HighWater { blocks }, 9))
+                Some(Ok((TunnelSignal::HighWater { blocks }, 9)))
             }
             Self::TAG_NACK => {
                 if buf.len() < 1 + 8 + 4 + 4 {
@@ -169,14 +176,14 @@ impl TunnelSignal {
                 let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
                 let have = u32::from_be_bytes(buf[9..13].try_into().unwrap());
                 let need = u32::from_be_bytes(buf[13..17].try_into().unwrap());
-                Some((TunnelSignal::Nack { block, have, need }, 17))
+                Some(Ok((TunnelSignal::Nack { block, have, need }, 17)))
             }
             Self::TAG_RELIABLE_REQUEST => {
                 if buf.len() < 1 + 8 {
                     return None;
                 }
                 let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-                Some((TunnelSignal::ReliableRequest { block }, 9))
+                Some(Ok((TunnelSignal::ReliableRequest { block }, 9)))
             }
             Self::TAG_RELIABLE_DATA => {
                 if buf.len() < 1 + 8 + 4 {
@@ -186,31 +193,33 @@ impl TunnelSignal {
                 let len = u32::from_be_bytes(buf[9..13].try_into().unwrap()) as usize;
                 if len > Self::MAX_RELIABLE_DATA {
                     // Malformed/hostile length: resync by consuming the header.
-                    return Some((TunnelSignal::ReliableRequest { block }, 13));
+                    return Some(Ok((TunnelSignal::ReliableRequest { block }, 13)));
                 }
                 let end = 13 + len;
                 if buf.len() < end {
                     return None; // need the whole payload
                 }
                 let bytes = buf[13..end].to_vec();
-                Some((TunnelSignal::ReliableData { block, bytes }, end))
+                Some(Ok((TunnelSignal::ReliableData { block, bytes }, end)))
             }
             Self::TAG_CREDIT => {
                 if buf.len() < 1 + 8 {
                     return None;
                 }
                 let delivered = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-                Some((TunnelSignal::Credit { delivered }, 9))
+                Some(Ok((TunnelSignal::Credit { delivered }, 9)))
             }
             Self::TAG_BLOCKACK => {
                 if buf.len() < 1 + 8 {
                     return None;
                 }
                 let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-                Some((TunnelSignal::BlockAck { block }, 9))
+                Some(Ok((TunnelSignal::BlockAck { block }, 9)))
             }
-            // Unknown tag: consume one byte to resync rather than deadlock.
-            _ => Some((TunnelSignal::BlockCount { total: u64::MAX }, 1)),
+            // Unknown tag: drop one byte and resync. Previously this synthesised
+            // a BlockCount { total: u64::MAX } which permanently hung the
+            // downstream task (highest_delivered() could never reach u64::MAX).
+            _ => Some(Err(1)),
         }
     }
 }
@@ -245,6 +254,15 @@ pub struct DatagramHub {
 /// Cap on buffered symbols per unregistered stream, to bound memory if a peer
 /// sends datagrams for a stream that is never opened.
 const MAX_PENDING_PER_STREAM: usize = 256;
+
+/// Cap on the number of *distinct* stream_ids that can have pending datagrams
+/// buffered at once. Each pending stream holds up to MAX_PENDING_PER_STREAM
+/// symbols, so without this cap an attacker spraying random stream_ids (the
+/// 64-bit id space is too large to enumerate) can balloon the hub's memory
+/// up to MAX_PENDING_PER_STREAM * 2^64 in the limit. 1024 streams * 256
+/// symbols * ~1100 B = ~288 MB worst case — bounded and well above the
+/// realistic maximum number of in-flight tunnels per connection.
+const MAX_PENDING_STREAMS: usize = 1024;
 
 struct HubInner {
     routes: HashMap<StreamId, mpsc::UnboundedSender<InboundSymbol>>,
@@ -300,12 +318,34 @@ impl DatagramHub {
         let mut inner = self.inner.lock().unwrap();
         if let Some(tx) = inner.routes.get(&hdr.stream_id) {
             let _ = tx.send(sym);
-        } else {
-            let buf = inner.pending.entry(hdr.stream_id).or_default();
-            if buf.len() < MAX_PENDING_PER_STREAM {
-                buf.push(sym);
-            }
+            return;
         }
+        // Unknown stream — buffer only if both we don't already have a slot
+        // for it AND we're under the distinct-stream cap. The cap matters
+        // because an attacker can spray random 8-byte stream_ids and the
+        // 64-bit space is too large to enumerate, so without it the pending
+        // map grows without bound.
+        if !inner.pending.contains_key(&hdr.stream_id) {
+            if inner.pending.len() >= MAX_PENDING_STREAMS {
+                tracing::warn!(
+                    stream_id = hdr.stream_id,
+                    pending_streams = inner.pending.len(),
+                    "datagram for unregistered stream dropped: pending stream cap reached"
+                );
+                return;
+            }
+            inner.pending.insert(hdr.stream_id, Vec::new());
+        }
+        let buf = inner
+            .pending
+            .get_mut(&hdr.stream_id)
+            .expect("just inserted");
+        if buf.len() < MAX_PENDING_PER_STREAM {
+            buf.push(sym);
+        }
+        // else: per-stream cap hit, drop silently — the legitimate start-of-
+        // tunnel burst is well under this, so a cap-hit is by definition
+        // pathological.
     }
 }
 
@@ -860,7 +900,7 @@ mod tests {
         ];
         for sig in cases {
             let bytes = sig.encode();
-            let (decoded, used) = TunnelSignal::decode(&bytes).unwrap();
+            let (decoded, used) = TunnelSignal::decode(&bytes).unwrap().unwrap();
             assert_eq!(decoded, sig);
             assert_eq!(used, bytes.len());
         }
@@ -879,6 +919,10 @@ mod tests {
         }
         .encode();
         assert!(TunnelSignal::decode(&rd[..15]).is_none());
+        // An unknown tag is reported as Err(1) so the caller can drain it
+        // without the buffer deadlocking on an unrecognised byte.
+        assert_eq!(TunnelSignal::decode(&[0xFF]).unwrap().unwrap_err(), 1);
+        assert!(TunnelSignal::decode(&[]).is_none());
     }
 
     /// The full Phase-3 convergence loop, driven through the real receiver tick:
@@ -1169,6 +1213,61 @@ mod tests {
         assert!(
             retained_bytes <= SENDER_RETAIN_BYTES + cap as u64,
             "retained payload bytes {retained_bytes} exceed budget {SENDER_RETAIN_BYTES}"
+        );
+    }
+
+    /// Build a wire-format datagram that `DatagramHub::dispatch` will accept:
+    /// a valid `SymbolHeader` followed by a small payload.
+    fn datagram_for(stream: u64, block: u64, esi: u32) -> Vec<u8> {
+        use raptun_proto::{datagram::SymbolHeader, Encode};
+        let hdr = SymbolHeader {
+            stream_id: stream,
+            block_id: block,
+            esi,
+            flags: raptun_proto::datagram::SymbolFlags::empty(),
+        };
+        let mut buf = Vec::new();
+        hdr.encode(&mut buf);
+        buf.extend_from_slice(&[0u8; 16]);
+        buf
+    }
+
+    #[test]
+    fn hub_caps_distinct_pending_streams() {
+        // An attacker spraying random 8-byte stream_ids used to create one
+        // entry per id in the pending map (capped at MAX_PENDING_PER_STREAM
+        // symbols each, but unbounded *in number of streams*). The cap on
+        // distinct streams bounds memory to a known worst case.
+        let hub = DatagramHub::new();
+        for s in 0..(MAX_PENDING_STREAMS as u64 + 5) {
+            hub.dispatch(&datagram_for(s, 1, 0));
+        }
+        let inner = hub.inner.lock().unwrap();
+        assert_eq!(
+            inner.pending.len(),
+            MAX_PENDING_STREAMS,
+            "pending stream count must be capped, not grow without bound"
+        );
+    }
+
+    #[test]
+    fn hub_routes_known_stream_and_drops_excess_per_stream() {
+        // For a registered stream, dispatch delivers symbols to its channel.
+        // Beyond MAX_PENDING_PER_STREAM for an *unregistered* stream, the
+        // per-stream symbol cap kicks in and the rest are dropped — the
+        // legitimate start-of-tunnel burst is well under this.
+        let hub = DatagramHub::new();
+        let _rx = hub.register(42);
+        hub.dispatch(&datagram_for(42, 1, 0));
+        // Unknown stream: fill to per-stream cap, then verify the cap holds.
+        for i in 0..(MAX_PENDING_PER_STREAM + 5) {
+            hub.dispatch(&datagram_for(99, i as u64, 0));
+        }
+        let inner = hub.inner.lock().unwrap();
+        assert_eq!(
+            inner.pending.get(&99).map(|v| v.len()),
+            Some(MAX_PENDING_PER_STREAM),
+            "per-stream pending must stop at MAX_PENDING_PER_STREAM"
         );
     }
 }

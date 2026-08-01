@@ -264,12 +264,10 @@ fn run_scenario(
         }
         // Deliver signaling-channel arrivals (both directions share `sig`).
         for item in sig.ready(now) {
-            if let Some((signal, _)) = TunnelSignal::decode(&item.payload) {
+            if let Some(Ok((signal, _))) = TunnelSignal::decode(&item.payload) {
                 match signal {
                     TunnelSignal::BlockCount { total } => {
-                        if total != u64::MAX {
-                            receiver.set_total_blocks(total);
-                        }
+                        receiver.set_total_blocks(total);
                     }
                     TunnelSignal::HighWater { blocks } => {
                         receiver.set_high_water(blocks);
