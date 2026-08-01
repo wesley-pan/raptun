@@ -153,16 +153,30 @@ async fn serve_connection(
         spawn_client_heartbeat(Arc::clone(&conn), Arc::clone(&active), interval);
     }
 
+    // M2: collect every per-tunnel task into a JoinSet so we can abort them
+    // all when the connection scope ends. `JoinSet::Drop` aborts every still-
+    // running task, so the right-shutdown semantics are "live tunnels die
+    // when the QUIC connection dies", with no orphans left for the rest of
+    // the process. `join_next` reaps finished tasks without blocking.
+    let mut tunnels: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
         // Race accepting a local connection against the QUIC connection closing,
         // so a server that goes away while we are idle triggers a reconnect
-        // instead of leaving us blocked in `accept()`.
+        // instead of leaving us blocked in `accept()`. The third arm reaps
+        // finished per-tunnel tasks so the set doesn't grow without bound
+        // over a long-lived connection.
         let (tcp, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             closed = conn.closed() => {
                 tracing::debug!(reason = %closed, "quic connection closed while idle");
                 return Ok(());
             }
+            // A per-tunnel task finished; ignore its JoinError (panic or
+            // external abort). `continue` restarts the loop so we re-poll
+            // the select — the joint set is now smaller and a future
+            // accept is more likely to win the race.
+            Some(_result) = tunnels.join_next(), if !tunnels.is_empty() => continue,
         };
         tracing::debug!(%peer, "accepted local connection");
         let conn = Arc::clone(&conn);
@@ -171,12 +185,7 @@ async fn serve_connection(
         let active = Arc::clone(&active);
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
-        // The JoinHandle is intentionally dropped — the per-tunnel future
-        // lives for the connection's lifetime and is bounded by `serve_connection`
-        // returning. A proper "abort on connection close" (M2) would collect
-        // handles in the connection scope and abort them when the conn
-        // closes; that's a larger refactor tracked separately.
-        tokio::spawn(async move {
+        tunnels.spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
             active.fetch_add(1, Ordering::Relaxed);
@@ -422,13 +431,29 @@ async fn handle_server_conn(
     let budget = new_conn_budget(&conn, &fec, &config);
     let send_window = new_conn_send_window(&conn, &fec);
 
+    // M2: same JoinSet pattern as the client. When the connection scope ends
+    // (conn closes, accept_bi errors, etc.), the JoinSet's Drop aborts every
+    // still-running per-tunnel task, so we never leave orphaned tunnels around
+    // for the rest of the process to clean up.
+    let mut tunnels: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::debug!(%remote, error = %e, "connection ended");
-                return Ok(());
-            }
+        // Race accept_bi against finished-tunnel reaps. accept_bi's Err is
+        // the conn-close signal; that path also drops `tunnels` and aborts
+        // everything. The `Some` arm only fires when a tunnel completes.
+        let (mut send, mut recv) = tokio::select! {
+            accepted = conn.accept_bi() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!(%remote, error = %e, "connection ended");
+                    return Ok(());
+                }
+            },
+            // Tunnel finished: re-enter the select so a future accept wins.
+            // `tunnels.is_empty()` would yield `None` from `join_next` and
+            // panic on `Some(_result) =` pattern matching, so the `if` guard
+            // disables the arm when there's nothing to reap.
+            Some(_result) = tunnels.join_next(), if !tunnels.is_empty() => continue,
         };
         let conn = Arc::clone(&conn);
         let hub = hub.clone();
@@ -436,10 +461,7 @@ async fn handle_server_conn(
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
         let registry = registry.clone();
-        // AbortOnDrop (M2) reverted for the same reason as the client side
-        // above: the per-iteration scope would abort the tunnel every loop
-        // iteration. Proper fix is connection-scoped handle storage.
-        tokio::spawn(async move {
+        tunnels.spawn(async move {
             // Bound the target connect: an unreachable target must not park this
             // tunnel on the OS default timeout while its QUIC stream stays open.
             let connect = tokio::time::timeout(connect_timeout, TcpStream::connect(target)).await;
