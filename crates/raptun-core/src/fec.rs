@@ -270,8 +270,17 @@ const MAX_PENDING_PER_STREAM: usize = 256;
 /// realistic maximum number of in-flight tunnels per connection.
 pub const MAX_PENDING_STREAMS: usize = 1024;
 
+/// Per-route channel capacity (symbols buffered for a single registered
+/// stream before its consumer drains them). Bounds the per-stream backlog
+/// when the downstream task is slow or stalled: a full channel means
+/// `dispatch` drops new symbols instead of growing memory without bound
+/// (M1). Generous by design — one head-of-queue block plus a few in-flight
+/// repairs is well under 100 symbols for the default K=16; 1024 covers a
+/// very large K with a much-slowed receiver.
+pub const ROUTE_CAPACITY: usize = 1024;
+
 struct HubInner {
-    routes: HashMap<StreamId, mpsc::UnboundedSender<InboundSymbol>>,
+    routes: HashMap<StreamId, mpsc::Sender<InboundSymbol>>,
     /// Symbols that arrived before their stream was registered.
     pending: HashMap<StreamId, Vec<InboundSymbol>>,
 }
@@ -300,14 +309,32 @@ impl DatagramHub {
     /// across the whole connection, and a leak here would silently drop
     /// inbound symbols for the rest of the connection's life.
     ///
+    /// The per-route channel is bounded ([`ROUTE_CAPACITY`]) so a stalled
+    /// downstream task cannot accumulate an unbounded backlog of symbols in
+    /// memory (M1). When full, `dispatch` drops the new symbol and logs a
+    /// rate-limited warn so a wedged receiver is operator-visible.
+    ///
     /// Any symbols buffered before registration are replayed immediately, in
-    /// arrival order.
+    /// arrival order. Replay uses `try_send`: the startup burst is well
+    /// under the cap, and we cannot `blocking_send` here (this is called
+    /// from a runtime thread, where blocking the executor is a panic).
     pub fn register(&self, stream_id: StreamId) -> HubGuard {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(ROUTE_CAPACITY);
         let mut inner = self.inner.lock().unwrap();
         if let Some(buffered) = inner.pending.remove(&stream_id) {
             for sym in buffered {
-                let _ = tx.send(sym);
+                if let Err(mpsc::error::TrySendError::Full(returned)) = tx.try_send(sym) {
+                    // Should be impossible: startup burst << ROUTE_CAPACITY
+                    // and no consumer is yet attached. If it ever happens
+                    // (e.g. a future change inflates the burst), drop the
+                    // excess rather than block the executor.
+                    tracing::warn!(
+                        stream_id,
+                        cap = ROUTE_CAPACITY,
+                        "dropping replay symbol: channel full at register time"
+                    );
+                    let _ = returned;
+                }
             }
         }
         inner.routes.insert(stream_id, tx);
@@ -328,6 +355,14 @@ impl DatagramHub {
         inner.pending.remove(&stream_id);
     }
 
+    /// True if `stream_id` currently has an active registered route. Used by
+    /// the server side to reject duplicate `stream_id`s announced on the
+    /// control stream — a peer that re-uses an id would otherwise overwrite
+    /// the prior route, leaving the older tunnel's receiver silent (M3).
+    pub fn has_route(&self, stream_id: StreamId) -> bool {
+        self.inner.lock().unwrap().routes.contains_key(&stream_id)
+    }
+
     /// Number of *distinct* stream_ids currently buffered but not yet routed.
     /// Public so integration tests can assert the cap end-to-end and ops
     /// tooling can inspect hub state.
@@ -344,8 +379,27 @@ impl DatagramHub {
         let sym = (hdr.block_id, hdr.esi, Bytes::copy_from_slice(payload));
         let mut inner = self.inner.lock().unwrap();
         if let Some(tx) = inner.routes.get(&hdr.stream_id) {
-            let _ = tx.send(sym);
-            return;
+            // try_send (not send().await) because we're inside the HubInner
+            // mutex — awaiting here would deadlock the whole hub. A full
+            // channel means the consumer is wedged; dropping the new symbol
+            // is the right back-pressure (FEC will surface the missing
+            // symbol via the receiver's NACK path on its next tick).
+            match tx.try_send(sym) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        stream_id = hdr.stream_id,
+                        cap = ROUTE_CAPACITY,
+                        "symbol dropped: route channel full (consumer wedged?)"
+                    );
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Route is gone (guard dropped, mid-iteration). Just
+                    // let the next sweep clean it up.
+                    return;
+                }
+            }
         }
         // Unknown stream — buffer only if both we don't already have a slot
         // for it AND we're under the distinct-stream cap. The cap matters
@@ -385,7 +439,7 @@ impl DatagramHub {
 pub struct HubGuard {
     hub: DatagramHub,
     stream_id: StreamId,
-    rx: Option<mpsc::UnboundedReceiver<InboundSymbol>>,
+    rx: Option<mpsc::Receiver<InboundSymbol>>,
 }
 
 impl HubGuard {
@@ -393,13 +447,13 @@ impl HubGuard {
     /// guard no longer removes the route — useful when the channel needs to
     /// outlive the guard (it does not, in the current code, but the API
     /// allows the pattern).
-    pub fn take_rx(&mut self) -> mpsc::UnboundedReceiver<InboundSymbol> {
+    pub fn take_rx(&mut self) -> mpsc::Receiver<InboundSymbol> {
         self.rx.take().expect("rx already taken")
     }
 }
 
 impl std::ops::Deref for HubGuard {
-    type Target = mpsc::UnboundedReceiver<InboundSymbol>;
+    type Target = mpsc::Receiver<InboundSymbol>;
     fn deref(&self) -> &Self::Target {
         self.rx.as_ref().expect("rx already taken")
     }

@@ -171,6 +171,11 @@ async fn serve_connection(
         let active = Arc::clone(&active);
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
+        // The JoinHandle is intentionally dropped — the per-tunnel future
+        // lives for the connection's lifetime and is bounded by `serve_connection`
+        // returning. A proper "abort on connection close" (M2) would collect
+        // handles in the connection scope and abort them when the conn
+        // closes; that's a larger refactor tracked separately.
         tokio::spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
@@ -431,6 +436,9 @@ async fn handle_server_conn(
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
         let registry = registry.clone();
+        // AbortOnDrop (M2) reverted for the same reason as the client side
+        // above: the per-iteration scope would abort the tunnel every loop
+        // iteration. Proper fix is connection-scoped handle storage.
         tokio::spawn(async move {
             // Bound the target connect: an unreachable target must not park this
             // tunnel on the OS default timeout while its QUIC stream stays open.
@@ -678,7 +686,7 @@ async fn server_tunnel_fec(
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
     tcp: TcpStream,
-    sig_send: quinn::SendStream,
+    mut sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
     registry: Option<Arc<TunnelRegistry>>,
     remote: SocketAddr,
@@ -689,6 +697,23 @@ async fn server_tunnel_fec(
         .await
         .map_err(|e| CoreError::Endpoint(format!("read stream id: {e}")))?;
     let stream_id = u64::from_be_bytes(id_buf);
+
+    // M3: refuse to overwrite an active route. A peer that re-uses a
+    // stream_id would otherwise overwrite the prior route, leaving the
+    // older tunnel's receiver silent (its sender is still in the routes
+    // map but the route points at a different channel). Reject and reset
+    // the stream so the client sees the failure cleanly.
+    if hub.has_route(stream_id) {
+        tracing::warn!(
+            stream_id,
+            %remote,
+            "duplicate stream_id on the control stream; resetting tunnel"
+        );
+        let _ = sig_send.reset(TARGET_UNREACHABLE_CODE);
+        return Err(CoreError::Endpoint(format!(
+            "duplicate stream_id {stream_id}"
+        )));
+    }
 
     // HubGuard unregisters on drop, including panic — see client_tunnel_fec.
     let mut inbound = hub.register(stream_id);
@@ -753,7 +778,7 @@ async fn run_fec_tunnel(
     tcp: TcpStream,
     sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
-    inbound: tokio::sync::mpsc::UnboundedReceiver<crate::fec::InboundSymbol>,
+    inbound: tokio::sync::mpsc::Receiver<crate::fec::InboundSymbol>,
     // Live stats sink for the server monitor UI; `None` on the client and
     // whenever monitoring is off, in which case the data loops touch nothing.
     stats: Option<Arc<TunnelStats>>,
@@ -1266,7 +1291,14 @@ async fn run_fec_tunnel(
     // and must NOT interrupt the data directions, which may still be flushing
     // the final bytes — in that case we fall through to awaiting them.
     let data = async {
-        let (up_r, down_r, _w) = tokio::join!(up, down, writer);
+        let (up_r, down_r, w_r) = tokio::join!(up, down, writer);
+        if let Err(e) = w_r {
+            // The signaling writer saw an error after H5. Log once at warn
+            // so it's not silently swallowed — the underlying cause is
+            // already in the writer's own warn line; this is a backstop
+            // for the case where data directions masked the failure.
+            tracing::warn!(error = %e, "signaling writer task returned error");
+        }
         up_r?;
         down_r?;
         Ok::<(), CoreError>(())

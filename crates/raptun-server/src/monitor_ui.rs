@@ -233,6 +233,12 @@ fn sample(
     let mut group_names: Vec<String> = groups.keys().cloned().collect();
     group_names.sort();
 
+    // Connections that received an RTT/loss sample this tick; the rest get
+    // evicted at the end so the `conns` map doesn't grow without bound as
+    // old connections close (H8). `stable_id` is reused by QUIC over time,
+    // so a stale entry could even mask a new connection's loss stats.
+    let mut touched_conns: std::collections::HashSet<usize> = Default::default();
+
     for remote in group_names {
         let members = &groups[&remote];
         // Connection-level RTT/loss: sample once from any live member's conn.
@@ -241,7 +247,9 @@ fn sample(
         if let Some(conn) = members.iter().find_map(|m| m.connection()) {
             rtt_ms = Some(conn.rtt().as_millis() as u64);
             let stats = conn.stats();
-            let ch = conns.entry(conn.stable_id()).or_default();
+            let sid = conn.stable_id();
+            touched_conns.insert(sid);
+            let ch = conns.entry(sid).or_default();
             let sent = stats.path.sent_packets;
             let lost = stats.path.lost_packets;
             let d_sent = sent.saturating_sub(ch.last_sent);
@@ -403,6 +411,12 @@ fn sample(
             });
         }
     }
+    // Evict `conns` entries for connections that disappeared this tick.
+    // Without this, every QUIC stable_id ever seen stays in the map for the
+    // life of the process; the map also holds a *windowed-loss state* tied
+    // to a now-dead connection, so leaving stale entries would also corrupt
+    // a future re-use of the same stable_id (H8).
+    conns.retain(|sid, _| touched_conns.contains(sid));
     rows
 }
 
