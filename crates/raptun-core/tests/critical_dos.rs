@@ -24,7 +24,6 @@ use raptun_core::tls::{ServerIdentity, ServerTrust};
 use raptun_proto::control::FecParams;
 use raptun_proto::datagram::SymbolHeader;
 use raptun_proto::{Decode, Encode};
-use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 static LOCK: Mutex<()> = Mutex::const_new(());
@@ -123,7 +122,6 @@ async fn server_clamps_malicious_block_size() {
     recv.read_exact(&mut body).await.expect("body");
     let mut slice = body.as_slice();
     let msg = Message::decode(&mut slice).expect("decode");
-    drop(slice);
 
     let HelloAck { version: _, fec } = match msg {
         Message::HelloAck(h) => h,
