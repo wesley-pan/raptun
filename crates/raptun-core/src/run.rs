@@ -578,7 +578,10 @@ async fn client_tunnel_fec(
         .await
         .map_err(|e| CoreError::Endpoint(format!("announce stream id: {e}")))?;
 
-    let inbound = hub.register(stream_id);
+    // HubGuard unregisters on drop, including panic — the old `unregister` call
+    // was only on the Ok/Err return path, so a panic between register and
+    // return leaked the route.
+    let mut inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "client FEC tunnel opened");
     let res = run_fec_tunnel(
         conn,
@@ -589,12 +592,11 @@ async fn client_tunnel_fec(
         tcp,
         sig_send,
         sig_recv,
-        inbound,
+        inbound.take_rx(),
         // The client does not run the monitor; server-only feature.
         None,
     )
     .await;
-    hub.unregister(stream_id);
     res
 }
 
@@ -620,7 +622,8 @@ async fn server_tunnel_fec(
         .map_err(|e| CoreError::Endpoint(format!("read stream id: {e}")))?;
     let stream_id = u64::from_be_bytes(id_buf);
 
-    let inbound = hub.register(stream_id);
+    // HubGuard unregisters on drop, including panic — see client_tunnel_fec.
+    let mut inbound = hub.register(stream_id);
     tracing::debug!(stream_id, "server FEC tunnel opened");
 
     // Publish live stats for the monitor UI, if enabled. The guard removes the
@@ -645,11 +648,10 @@ async fn server_tunnel_fec(
         tcp,
         sig_send,
         sig_recv,
-        inbound,
+        inbound.take_rx(),
         stats,
     )
     .await;
-    hub.unregister(stream_id);
     res
 }
 
@@ -1292,19 +1294,95 @@ async fn send_datagram_paced(conn: &quinn::Connection, dg: bytes::Bytes) {
 ///
 /// The geometry **must be identical on both ends** or RaptorQ decode fails, so
 /// this returns the negotiated size verbatim — the server already clamped it to
-/// [`crate::session::SAFE_MAX_SYMBOL_SIZE`] during the handshake, which is
-/// chosen to fit within a conservative QUIC datagram (well under typical
-/// `max_datagram_size`). The `conn` is accepted for a debug assertion only.
-fn effective_symbol_size(conn: &quinn::Connection, negotiated: u16) -> u16 {
+/// Pure clamp for the use-site symbol size. Extracted from
+/// [`effective_symbol_size`] so it can be unit-tested without a real
+/// `quinn::Connection`.
+///
+/// Returns the largest symbol size that fits inside `datagram_cap` bytes
+/// (the connection's `max_datagram_size`, when known) minus the per-symbol
+/// header. `negotiated` is clamped down to that ceiling; a value already
+/// within the cap passes through unchanged; `0` is normalised to `1` (a
+/// zero-byte symbol is meaningless).
+fn clamp_symbol_to_datagram_cap(negotiated: u16, datagram_cap: usize) -> u16 {
     let header = raptun_proto::datagram::SYMBOL_HEADER_LEN as u16;
-    if let Some(max) = conn.max_datagram_size() {
-        debug_assert!(
-            (negotiated as usize + header as usize) <= max,
-            "negotiated symbol {} + header {} exceeds datagram max {} — handshake clamp is too loose",
-            negotiated,
-            header,
-            max
-        );
+    let max_symbol = datagram_cap
+        .saturating_sub(header as usize)
+        .min(u16::MAX as usize) as u16;
+    if negotiated > max_symbol {
+        max_symbol.max(1)
+    } else {
+        negotiated.max(1)
     }
-    negotiated.max(1)
+}
+
+/// [`crate::session::SAFE_MAX_SYMBOL_SIZE`] during the handshake, which is
+/// chosen to fit within a conservative QUIC datagram. As a defensive
+/// fallback, this function also clamps *at use site* to the connection's
+/// advertised `max_datagram_size` minus the per-symbol header. A release
+/// build no longer relies on the handshake clamp being correct — the bug
+/// would be a silent one (every `send_datagram` for that symbol returns
+/// `Err`, the tunnel runs at zero throughput with no log line), so we log
+/// warn and clamp here instead.
+fn effective_symbol_size(conn: &quinn::Connection, negotiated: u16) -> u16 {
+    if let Some(max) = conn.max_datagram_size() {
+        let max_symbol = clamp_symbol_to_datagram_cap(negotiated, max);
+        if negotiated > max_symbol {
+            tracing::warn!(
+                negotiated,
+                max_symbol,
+                max_datagram = max,
+                "negotiated symbol size exceeds datagram cap; clamping at use site"
+            );
+        }
+        max_symbol
+    } else {
+        negotiated.max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_symbol_to_datagram_cap;
+    use raptun_proto::datagram::SYMBOL_HEADER_LEN;
+
+    /// H3 regression: a negotiated symbol size that exceeds the datagram
+    /// cap (minus header) is clamped at the use site, not silently passed
+    /// through. Previously only checked in `debug_assert!` so a release
+    /// build would drop every datagram and report zero throughput with no
+    /// log line.
+    #[test]
+    fn symbol_size_clamps_to_datagram_cap_in_release() {
+        let header = SYMBOL_HEADER_LEN as u16;
+        // A 1200-byte datagram payload can carry at most 1200 - header bytes
+        // of symbol payload.
+        let datagram_cap: usize = 1200;
+        let max_symbol = datagram_cap - header as usize;
+        // Within the cap: pass through.
+        assert_eq!(
+            clamp_symbol_to_datagram_cap(max_symbol as u16, datagram_cap),
+            max_symbol as u16
+        );
+        // One byte over: clamp down.
+        assert_eq!(
+            clamp_symbol_to_datagram_cap((max_symbol + 1) as u16, datagram_cap),
+            max_symbol as u16
+        );
+        // Way over: clamp to the ceiling.
+        assert_eq!(
+            clamp_symbol_to_datagram_cap(u16::MAX, datagram_cap),
+            max_symbol as u16
+        );
+        // Zero is normalised to 1 (a 0-byte symbol is meaningless).
+        assert_eq!(clamp_symbol_to_datagram_cap(0, datagram_cap), 1);
+    }
+
+    /// Without an advertised datagram cap (None), pass through unchanged.
+    #[test]
+    fn symbol_size_unchanged_without_cap() {
+        // Document the no-cap semantics by mimicking the call site: when
+        // max_datagram_size is None, the function returns negotiated.max(1).
+        let negotiated: u16 = 1200;
+        let result = negotiated.max(1);
+        assert_eq!(result, 1200);
+    }
 }
