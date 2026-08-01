@@ -192,8 +192,14 @@ impl TunnelSignal {
                 let block = u64::from_be_bytes(buf[1..9].try_into().unwrap());
                 let len = u32::from_be_bytes(buf[9..13].try_into().unwrap()) as usize;
                 if len > Self::MAX_RELIABLE_DATA {
-                    // Malformed/hostile length: resync by consuming the header.
-                    return Some(Ok((TunnelSignal::ReliableRequest { block }, 13)));
+                    // Malformed/hostile length: the length field itself is
+                    // the problem, not a block to ship. Drop just the tag
+                    // byte and resync — the old behaviour synthesised a
+                    // ReliableRequest for the embedded block_id, which both
+                    // hid the framing error from the operator and prompted a
+                    // real reliable retransmit for a block the peer may never
+                    // have intended to ship (its length was bogus, after all).
+                    return Some(Err(1));
                 }
                 let end = 13 + len;
                 if buf.len() < end {
@@ -262,7 +268,7 @@ const MAX_PENDING_PER_STREAM: usize = 256;
 /// up to MAX_PENDING_PER_STREAM * 2^64 in the limit. 1024 streams * 256
 /// symbols * ~1100 B = ~288 MB worst case — bounded and well above the
 /// realistic maximum number of in-flight tunnels per connection.
-const MAX_PENDING_STREAMS: usize = 1024;
+pub const MAX_PENDING_STREAMS: usize = 1024;
 
 struct HubInner {
     routes: HashMap<StreamId, mpsc::UnboundedSender<InboundSymbol>>,
@@ -286,10 +292,17 @@ impl DatagramHub {
         }
     }
 
-    /// Register interest in a tunnel's `stream_id`, returning the channel its
-    /// symbols will arrive on. Any symbols buffered before registration are
-    /// replayed immediately, in arrival order.
-    pub fn register(&self, stream_id: StreamId) -> mpsc::UnboundedReceiver<InboundSymbol> {
+    /// Register interest in a tunnel's `stream_id`. Returns a [`HubGuard`]
+    /// that owns the receive channel and, on drop, removes the route from the
+    /// hub. Holding the guard for the lifetime of the tunnel guarantees the
+    /// route is removed even if the tunnel task panics or unwinds through a
+    /// `?` early-return — important because the hub's `routes` map is shared
+    /// across the whole connection, and a leak here would silently drop
+    /// inbound symbols for the rest of the connection's life.
+    ///
+    /// Any symbols buffered before registration are replayed immediately, in
+    /// arrival order.
+    pub fn register(&self, stream_id: StreamId) -> HubGuard {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut inner = self.inner.lock().unwrap();
         if let Some(buffered) = inner.pending.remove(&stream_id) {
@@ -298,14 +311,28 @@ impl DatagramHub {
             }
         }
         inner.routes.insert(stream_id, tx);
-        rx
+        HubGuard {
+            hub: self.clone(),
+            stream_id,
+            rx: Some(rx),
+        }
     }
 
-    /// Stop routing a tunnel's symbols (tunnel closed).
+    /// Stop routing a tunnel's symbols (tunnel closed). Equivalent to
+    /// dropping the [`HubGuard`] returned by `register`; the public method
+    /// remains for callers that need to tear down a route without holding
+    /// the guard (e.g. tests).
     pub fn unregister(&self, stream_id: StreamId) {
         let mut inner = self.inner.lock().unwrap();
         inner.routes.remove(&stream_id);
         inner.pending.remove(&stream_id);
+    }
+
+    /// Number of *distinct* stream_ids currently buffered but not yet routed.
+    /// Public so integration tests can assert the cap end-to-end and ops
+    /// tooling can inspect hub state.
+    pub fn pending_len(&self) -> usize {
+        self.inner.lock().unwrap().pending.len()
     }
 
     /// Route one received datagram. Symbols for a not-yet-registered stream are
@@ -346,6 +373,47 @@ impl DatagramHub {
         // else: per-stream cap hit, drop silently — the legitimate start-of-
         // tunnel burst is well under this, so a cap-hit is by definition
         // pathological.
+    }
+}
+
+/// RAII guard for a registered hub route. Holds the inbound symbol channel
+/// and, on drop, removes the route from the hub. Mirrors `RegistryGuard` in
+/// `raptun_core::monitor` — the contract is the same: even a panic or early
+/// `?` return in the tunnel task must remove the route, otherwise inbound
+/// symbols silently get dropped (no route to forward to) and the connection
+/// slowly degrades without any operator signal.
+pub struct HubGuard {
+    hub: DatagramHub,
+    stream_id: StreamId,
+    rx: Option<mpsc::UnboundedReceiver<InboundSymbol>>,
+}
+
+impl HubGuard {
+    /// Take the underlying receive channel. After this call, dropping the
+    /// guard no longer removes the route — useful when the channel needs to
+    /// outlive the guard (it does not, in the current code, but the API
+    /// allows the pattern).
+    pub fn take_rx(&mut self) -> mpsc::UnboundedReceiver<InboundSymbol> {
+        self.rx.take().expect("rx already taken")
+    }
+}
+
+impl std::ops::Deref for HubGuard {
+    type Target = mpsc::UnboundedReceiver<InboundSymbol>;
+    fn deref(&self) -> &Self::Target {
+        self.rx.as_ref().expect("rx already taken")
+    }
+}
+
+impl std::ops::DerefMut for HubGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.rx.as_mut().expect("rx already taken")
+    }
+}
+
+impl Drop for HubGuard {
+    fn drop(&mut self) {
+        self.hub.unregister(self.stream_id);
     }
 }
 
@@ -1257,7 +1325,7 @@ mod tests {
         // per-stream symbol cap kicks in and the rest are dropped — the
         // legitimate start-of-tunnel burst is well under this.
         let hub = DatagramHub::new();
-        let _rx = hub.register(42);
+        let _guard = hub.register(42);
         hub.dispatch(&datagram_for(42, 1, 0));
         // Unknown stream: fill to per-stream cap, then verify the cap holds.
         for i in 0..(MAX_PENDING_PER_STREAM + 5) {
@@ -1269,5 +1337,66 @@ mod tests {
             Some(MAX_PENDING_PER_STREAM),
             "per-stream pending must stop at MAX_PENDING_PER_STREAM"
         );
+    }
+
+    /// H1 regression: a tunnel task that holds a `HubGuard` releases the
+    /// route on Drop, including when a panic propagates out of the future.
+    /// Without the guard, an unwind between `register` and the normal
+    /// `unregister` call would leak the route for the lifetime of the
+    /// connection.
+    #[test]
+    fn hub_guard_releases_route_on_drop() {
+        let hub = Arc::new(DatagramHub::new());
+        {
+            let _guard = hub.register(7);
+            assert!(
+                hub.inner.lock().unwrap().routes.contains_key(&7),
+                "guard must keep the route installed while alive"
+            );
+        }
+        assert!(
+            !hub.inner.lock().unwrap().routes.contains_key(&7),
+            "guard drop must remove the route"
+        );
+    }
+
+    #[test]
+    fn hub_guard_releases_on_panic() {
+        let hub = Arc::new(DatagramHub::new());
+        // Use catch_unwind so the test process survives the panic; the guard
+        // is the *only* thing keeping the route installed, so its Drop on
+        // unwind is what we want to verify.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.register(13);
+            panic!("simulated tunnel panic");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !hub.inner.lock().unwrap().routes.contains_key(&13),
+            "panic unwind must trigger HubGuard drop and remove the route"
+        );
+    }
+
+    /// H2 regression: a `ReliableData` whose length field exceeds the cap
+    /// used to be silently rewritten as a `ReliableRequest` for the embedded
+    /// block_id, triggering a real reliable retransmit for a block the peer
+    /// never actually sent. Now it is reported as garbage (1 byte to drop)
+    /// and the caller logs a warning.
+    #[test]
+    fn oversized_reliable_data_is_garbage_not_a_request() {
+        // TAG_RELIABLE_DATA = 4, then 8-byte block_id = 9, then 4-byte
+        // length = u32::MAX (> MAX_RELIABLE_DATA = 1 MiB).
+        let mut buf = vec![TunnelSignal::TAG_RELIABLE_DATA];
+        buf.extend_from_slice(&9u64.to_be_bytes());
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        let outcome = TunnelSignal::decode(&buf).expect("decode returns outcome");
+        match outcome {
+            Ok((TunnelSignal::ReliableRequest { .. }, n)) => panic!(
+                "oversized ReliableData must NOT synthesise a ReliableRequest; \
+                 got Ok with n={n}"
+            ),
+            Ok((sig, _)) => panic!("unexpected Ok signal: {sig:?}"),
+            Err(n) => assert_eq!(n, 1, "drop just the tag byte"),
+        }
     }
 }
