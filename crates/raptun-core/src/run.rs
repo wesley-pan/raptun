@@ -7,8 +7,9 @@
 //! the accept/forward structure here.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,8 +150,24 @@ async fn serve_connection(
     // Count of currently-live tunnels, surfaced by the heartbeat. Each accepted
     // connection increments it and a guard decrements on completion.
     let active = Arc::new(AtomicU64::new(0));
+    // One LossTracker per QUIC connection, shared by the heartbeat task and
+    // every per-tunnel downstream task. The tracker is *connection-scoped* —
+    // not per-tunnel — so a fresh per-tunnel tracker does not establish a new
+    // `diag_prev` baseline on every tunnel open/close cycle. Pre-fix, each
+    // tunnel's first diagnostic call returned 0.0 (baseline) and was logged as
+    // a real `loss_pct=0.00`, which hid the actual 30-37% loss from the
+    // operator. The lock is held only for the few-line delta math in
+    // `read_telemetry`; contention is negligible (diagnostic fires at most
+    // every 2 s globally).
+    let conn_loss_tracker: Arc<Mutex<crate::telemetry::LossTracker>> =
+        Arc::new(Mutex::new(crate::telemetry::LossTracker::new()));
     if let Some(interval) = config.transport.heartbeat {
-        spawn_client_heartbeat(Arc::clone(&conn), Arc::clone(&active), interval);
+        spawn_client_heartbeat(
+            Arc::clone(&conn),
+            Arc::clone(&active),
+            Arc::clone(&conn_loss_tracker),
+            interval,
+        );
     }
 
     // M2: collect every per-tunnel task into a JoinSet so we can abort them
@@ -185,13 +202,23 @@ async fn serve_connection(
         let active = Arc::clone(&active);
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
+        let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
         tunnels.spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
             active.fetch_add(1, Ordering::Relaxed);
             let _guard = ActiveGuard(&active);
             let res = if use_fec {
-                handle_client_conn_fec(&conn, &hub, &fec, &budget, &send_window, tcp).await
+                handle_client_conn_fec(
+                    &conn,
+                    &hub,
+                    &fec,
+                    &budget,
+                    &send_window,
+                    &conn_loss_tracker,
+                    tcp,
+                )
+                .await
             } else {
                 handle_client_conn(&conn, tcp).await
             };
@@ -308,26 +335,54 @@ impl Drop for ActiveGuard<'_> {
 fn spawn_client_heartbeat(
     conn: Arc<quinn::Connection>,
     active: Arc<AtomicU64>,
+    conn_loss_tracker: Arc<Mutex<crate::telemetry::LossTracker>>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut loss_tracker = crate::telemetry::LossTracker::new();
         // Skip the immediate first tick so the heartbeat doesn't fire at t=0
         // right after the startup logs.
         ticker.tick().await;
+        // Skip the `loss_pct` field on the first real tick: the per-connection
+        // `window_loss` baseline is set by the first caller (often a per-tunnel
+        // task that runs at 20ms, long before the heartbeat's 1s tick), so
+        // the baseline-call detection inside `read_telemetry` rarely fires from
+        // the heartbeat. Track first-tick here so the operator never sees a
+        // misleading `0.00` on the very first heartbeat line.
+        let mut first_tick = true;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let sample = crate::session::read_telemetry(&conn, &mut loss_tracker);
-                    tracing::info!(
-                        rtt_ms = sample.smoothed_rtt.as_millis(),
-                        cwnd_bytes = sample.cwnd_bytes,
-                        loss_pct = format!("{:.2}", sample.loss_rate * 100.0),
-                        active_tunnels = active.load(Ordering::Relaxed),
-                        "tunnel alive"
+                    // First tick: only the post-baseline `loss_pct` is
+                    // unreliable (the 20ms-cadenced `window_loss` baseline
+                    // may be set by a per-tunnel task rather than the
+                    // heartbeat, so the literal-first-call detection in
+                    // `read_telemetry` doesn't apply). Skip the `loss_pct`
+                    // field on the first tick so the operator never sees a
+                    // potentially-misleading `0.00`; rtt / cwnd / tunnel
+                    // count are always meaningful.
+                    let sample = crate::session::read_telemetry(
+                        &conn,
+                        &mut *conn_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
+                    if first_tick {
+                        tracing::info!(
+                            rtt_ms = sample.smoothed_rtt.as_millis(),
+                            cwnd_bytes = sample.cwnd_bytes,
+                            active_tunnels = active.load(Ordering::Relaxed),
+                            "tunnel alive (loss_pct=baseline)"
+                        );
+                        first_tick = false;
+                    } else {
+                        tracing::info!(
+                            rtt_ms = sample.smoothed_rtt.as_millis(),
+                            cwnd_bytes = sample.cwnd_bytes,
+                            loss_pct = format!("{:.2}", sample.loss_rate * 100.0),
+                            active_tunnels = active.load(Ordering::Relaxed),
+                            "tunnel alive"
+                        );
+                    }
                 }
                 closed = conn.closed() => {
                     tracing::debug!(reason = %closed, "heartbeat stopping (connection closed)");
@@ -354,13 +409,14 @@ async fn handle_client_conn_fec(
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
+    conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     tcp: TcpStream,
 ) -> Result<()> {
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| CoreError::Endpoint(format!("open signaling bi: {e}")))?;
-    client_tunnel_fec(conn, hub, fec, budget, send_window, tcp, send, recv).await
+    client_tunnel_fec(conn, hub, fec, budget, send_window, conn_loss_tracker, tcp, send, recv).await
 }
 
 /// Run the server: listen for QUIC connections, run the handshake on each, and
@@ -430,6 +486,11 @@ async fn handle_server_conn(
     // the matching comment in `serve_connection`).
     let budget = new_conn_budget(&conn, &fec, &config);
     let send_window = new_conn_send_window(&conn, &fec);
+    // One LossTracker per QUIC connection, shared by every tunnel. See the
+    // matching comment in `serve_connection` for the rationale (B1 from the
+    // 2026-08-02 load test).
+    let conn_loss_tracker: Arc<Mutex<crate::telemetry::LossTracker>> =
+        Arc::new(Mutex::new(crate::telemetry::LossTracker::new()));
 
     // M2: same JoinSet pattern as the client. When the connection scope ends
     // (conn closes, accept_bi errors, etc.), the JoinSet's Drop aborts every
@@ -460,6 +521,7 @@ async fn handle_server_conn(
         let fec = fec.clone();
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
+        let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
         let registry = registry.clone();
         tunnels.spawn(async move {
             // Bound the target connect: an unreachable target must not park this
@@ -474,6 +536,7 @@ async fn handle_server_conn(
                             &fec,
                             &budget,
                             &send_window,
+                            &conn_loss_tracker,
                             tcp,
                             send,
                             recv,
@@ -665,6 +728,7 @@ async fn client_tunnel_fec(
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
+    conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
@@ -686,6 +750,7 @@ async fn client_tunnel_fec(
         fec,
         budget,
         send_window,
+        conn_loss_tracker,
         stream_id,
         tcp,
         sig_send,
@@ -707,6 +772,7 @@ async fn server_tunnel_fec(
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
+    conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
@@ -759,6 +825,7 @@ async fn server_tunnel_fec(
         fec,
         budget,
         send_window,
+        conn_loss_tracker,
         stream_id,
         tcp,
         sig_send,
@@ -796,6 +863,12 @@ async fn run_fec_tunnel(
     fec: &FecParams,
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
+    // Connection-wide LossTracker shared by every tunnel on this QUIC connection.
+    // The tracker was previously created per-tunnel, which made the first
+    // diagnostic on every new tunnel log a baseline 0.0 as a real reading
+    // (B1 from the 2026-08-02 load test). Lock is held only for the few-line
+    // delta math in `read_telemetry`; contention is negligible.
+    conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     stream_id: StreamId,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
@@ -1186,8 +1259,11 @@ async fn run_fec_tunnel(
     let down_conn = conn.clone();
     let down_sig = sig_tx.clone();
     let down_stats = stats.clone();
+    // Take a clone of the connection-wide LossTracker for this tunnel's down
+    // task. The shared tracker is owned by `serve_connection` / `handle_server_conn`
+    // and lives for the life of the QUIC connection.
+    let down_loss_tracker = Arc::clone(conn_loss_tracker);
     let mut classifier = crate::telemetry::RegimeClassifier::new();
-    let mut loss_tracker = crate::telemetry::LossTracker::new();
     let down = async move {
         let mut inbound = inbound;
         let mut receiver = FecReceiver::new(symbol_size, k);
@@ -1258,8 +1334,16 @@ async fn run_fec_tunnel(
                 _ = ticker.tick() => {
                     // Refresh telemetry-derived link state + budget ceiling, then
                     // arbitrate stalled blocks and emit NACKs / reliable requests.
-                    let sample = crate::session::read_telemetry(&down_conn, &mut loss_tracker);
+                    // The second tuple element (`is_window_baseline`) is for the
+                    // operator-facing heartbeat and is irrelevant to the FEC
+                    // controller; sample.loss_rate is 0.0 on the baseline tick,
+                    // which is the same default the controller always had.
+                    let sample = crate::session::read_telemetry(
+                        &down_conn,
+                        &mut *down_loss_tracker.lock().expect("loss tracker poisoned"),
+                    );
                     let link = classifier.to_link_state(sample);
+                    budget.refresh_ceiling(link.cwnd_bytes());
                     budget.refresh_ceiling(link.cwnd_bytes());
                     // Keep the connection-wide send window sized to the live cwnd
                     // so the sender's flow-control gate tracks link capacity.

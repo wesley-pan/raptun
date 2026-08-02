@@ -319,7 +319,14 @@ pub async fn recv_datagram(conn: &Connection) -> Result<Bytes> {
 pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> TransportSample {
     let stats = conn.stats();
     let path = stats.path;
-    let loss_rate = tracker.window_loss(path.sent_packets, path.lost_packets);
+    // `window_loss` returns `None` on the first call (only establishes a
+    // baseline) or when no new packets have been sent in the window. Treat
+    // both as 0% for the sample: the FEC controller's default "no loss seen
+    // yet, assume no loss" is the right behaviour for a 0-sent-window, and
+    // matches the pre-Option semantics.
+    let loss_rate = tracker
+        .window_loss(path.sent_packets, path.lost_packets)
+        .unwrap_or(0.0);
 
     // 诊断:当窗口丢包率 > 5% 且通过节流时,打印 Quinn 计数器的来源分解,
     // 用来区分"真实丢包"与"指标误判"。三条判据:
@@ -335,20 +342,28 @@ pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> Transport
         // `loss_rate` tick that tripped the gate: the latter has a tiny
         // denominator and swings to 100% on a single late packet. `loss_rate`
         // still drives the >5% trigger and the FEC controller unchanged.
-        let diag_pct = tracker.diag_loss(path.sent_packets, path.lost_packets);
-        tracing::info!(
-            target: "raptun_core::telemetry",
-            loss_pct = format!("{:.2}", diag_pct * 100.0),
-            sent_pkts = path.sent_packets,
-            lost_pkts = path.lost_packets,
-            lost_bytes = path.lost_bytes,
-            congestion_events = path.congestion_events,
-            black_holes = path.black_holes_detected,
-            udp_tx_dgrams = stats.udp_tx.datagrams,
-            udp_rx_dgrams = stats.udp_rx.datagrams,
-            cwnd_bytes = path.cwnd,
-            "quinn loss-source breakdown (path vs udp vs congestion)"
-        );
+        //
+        // `diag_loss` returns `None` on the very first diagnostic for this
+        // tracker (baseline only — no rate to report yet). Skip the log in
+        // that case: logging the baseline 0.0 as a real reading misleads
+        // operators, and was the B1 issue surfaced by the 2026-08-02 load
+        // test. The call still establishes `diag_prev` so subsequent calls
+        // produce real rates.
+        if let Some(diag_pct) = tracker.diag_loss(path.sent_packets, path.lost_packets) {
+            tracing::info!(
+                target: "raptun_core::telemetry",
+                loss_pct = format!("{:.2}", diag_pct * 100.0),
+                sent_pkts = path.sent_packets,
+                lost_pkts = path.lost_packets,
+                lost_bytes = path.lost_bytes,
+                congestion_events = path.congestion_events,
+                black_holes = path.black_holes_detected,
+                udp_tx_dgrams = stats.udp_tx.datagrams,
+                udp_rx_dgrams = stats.udp_rx.datagrams,
+                cwnd_bytes = path.cwnd,
+                "quinn loss-source breakdown (path vs udp vs congestion)"
+            );
+        }
     }
 
     TransportSample {

@@ -57,19 +57,26 @@ impl LossTracker {
     }
 
     /// Fold in the latest cumulative counters and return the loss rate over the
-    /// interval since the previous call. Returns 0.0 on the first call (only
+    /// interval since the previous call. Returns `None` on the first call (only
     /// establishes a baseline) or any interval with no newly-sent packets.
-    pub fn window_loss(&mut self, sent: u64, lost: u64) -> f64 {
+    ///
+    /// Like [`Self::diag_loss`], the baseline case is exposed as `None` so the
+    /// caller can distinguish "no measurement yet" from a real 0% reading.
+    /// The FEC controller treats a baseline as 0% (assumed no loss until seen),
+    /// which matches the pre-Option behaviour; the operator-facing heartbeat
+    /// skips the `loss_pct` field on baseline ticks so it doesn't display a
+    /// bogus `0.00` that looks like a real reading.
+    pub fn window_loss(&mut self, sent: u64, lost: u64) -> Option<f64> {
         let rate = match self.prev {
-            None => 0.0,
+            None => None,
             Some((ps, pl)) => {
                 // Counters are monotonic; guard against wraparound/reset.
                 let d_sent = sent.saturating_sub(ps);
                 let d_lost = lost.saturating_sub(pl);
                 if d_sent == 0 {
-                    0.0
+                    Some(0.0)
                 } else {
-                    (d_lost as f64 / d_sent as f64).clamp(0.0, 1.0)
+                    Some((d_lost as f64 / d_sent as f64).clamp(0.0, 1.0))
                 }
             }
         };
@@ -82,18 +89,24 @@ impl LossTracker {
     /// diagnostic (i.e. right after `allow_diag` returns true): unlike
     /// `window_loss`, whose 20 ms cadence gives a tiny, noisy denominator, this
     /// spans the full ~2 s diagnostic interval, so the logged figure reflects
-    /// the link over the window the log line actually represents. Returns 0.0
-    /// on the first diagnostic (baseline only) or a window with no new packets.
-    pub(crate) fn diag_loss(&mut self, sent: u64, lost: u64) -> f64 {
+    /// the link over the window the log line actually represents.
+    ///
+    /// Returns `None` on the first diagnostic (baseline only — no measurement
+    /// yet) or `Some(rate)` otherwise (the rate is 0.0 for an interval with no
+    /// newly-sent packets, which is a real "nothing happened" reading, not a
+    /// missing baseline). The `Option` exists to make the baseline-vs-measurement
+    /// distinction explicit to the caller; logging a baseline 0.0 as a real
+    /// `loss_pct` reading misleads operators (regression test: `diag_loss_is_none_on_baseline`).
+    pub(crate) fn diag_loss(&mut self, sent: u64, lost: u64) -> Option<f64> {
         let rate = match self.diag_prev {
-            None => 0.0,
+            None => None,
             Some((ps, pl)) => {
                 let d_sent = sent.saturating_sub(ps);
                 let d_lost = lost.saturating_sub(pl);
                 if d_sent == 0 {
-                    0.0
+                    Some(0.0)
                 } else {
-                    (d_lost as f64 / d_sent as f64).clamp(0.0, 1.0)
+                    Some((d_lost as f64 / d_sent as f64).clamp(0.0, 1.0))
                 }
             }
         };
@@ -234,20 +247,23 @@ mod tests {
     #[test]
     fn loss_tracker_is_windowed_not_cumulative() {
         let mut t = LossTracker::new();
-        // First call has no prior baseline → 0.
-        assert_eq!(t.window_loss(1000, 500), 0.0);
+        // First call has no prior baseline → None.
+        assert_eq!(t.window_loss(1000, 500), None);
         // Next interval: 100 more sent, 4 more lost ⇒ 4% for THIS window,
         // even though the cumulative ratio is 504/1100 ≈ 46%.
         let w = t.window_loss(1100, 504);
+        assert!(w.is_some(), "second call must produce a rate");
         assert!(
-            (w - 0.04).abs() < 1e-9,
-            "windowed loss should be 4%, got {w}"
+            (w.unwrap() - 0.04).abs() < 1e-9,
+            "windowed loss should be 4%, got {w:?}"
         );
-        // A clean interval reports ~0 regardless of the ugly cumulative history.
+        // A clean interval reports Some(0.0) (a real "no loss in this
+        // window" reading, NOT a missing-baseline artifact).
         let w2 = t.window_loss(1200, 504);
         assert_eq!(
-            w2, 0.0,
-            "a loss-free window must read 0, not the cumulative rate"
+            w2,
+            Some(0.0),
+            "a loss-free window must be Some(0.0), not None or the cumulative rate"
         );
     }
 
@@ -255,10 +271,11 @@ mod tests {
     fn loss_tracker_handles_no_new_packets_and_reset() {
         let mut t = LossTracker::new();
         t.window_loss(500, 10);
-        // No new packets sent this interval ⇒ 0 (avoid div-by-zero).
-        assert_eq!(t.window_loss(500, 10), 0.0);
+        // No new packets sent this interval ⇒ Some(0.0) (avoid div-by-zero,
+        // distinct from the baseline None case).
+        assert_eq!(t.window_loss(500, 10), Some(0.0));
         // Counter reset (e.g. reconnect) must not panic or go negative.
-        assert_eq!(t.window_loss(5, 1), 0.0);
+        assert_eq!(t.window_loss(5, 1), Some(0.0));
     }
 
     #[test]
@@ -268,12 +285,39 @@ mod tests {
         t.window_loss(1000, 100);
         t.window_loss(1010, 110); // last tick: 10 lost / 10 sent = 100% (noise)
                                   // First diagnostic only establishes the diag baseline.
-        assert_eq!(t.diag_loss(1010, 110), 0.0);
+        assert_eq!(t.diag_loss(1010, 110), None);
         // More 20ms ticks, then the next diagnostic ~2s later: 1000 sent,
         // 40 lost across the whole interval ⇒ 4%, NOT the 100% a single tick saw.
         t.window_loss(1500, 130);
         t.window_loss(2010, 150);
         let d = t.diag_loss(2010, 150);
-        assert!((d - 0.04).abs() < 1e-9, "diag loss should be 4%, got {d}");
+        assert!(d.is_some(), "second diagnostic must produce a rate");
+        assert!(
+            (d.unwrap() - 0.04).abs() < 1e-9,
+            "diag loss should be 4%, got {d:?}"
+        );
+    }
+
+    /// B1 regression: first `diag_loss` is a baseline, not a measurement.
+    /// Pre-fix, this returned `Some(0.0)` which the caller logged as a real
+    /// `loss_pct=0.00`. With 1000+ per-tunnel trackers each setting their own
+    /// baseline, this hid the actual 30-37% loss observed in the 2026-08-02
+    /// load test. The fix is to return `None` on the baseline call so the
+    /// caller can skip the log.
+    #[test]
+    fn diag_loss_is_none_on_baseline() {
+        let mut t = LossTracker::new();
+        // First call: no prior diag_prev → baseline only.
+        assert_eq!(
+            t.diag_loss(1000, 100),
+            None,
+            "baseline-only diagnostic must return None, not Some(0.0)"
+        );
+        // Real reading with 0 newly-lost is Some(0.0), not None.
+        assert_eq!(t.diag_loss(1010, 100), Some(0.0));
+        // Real loss rate after that.
+        let d = t.diag_loss(1110, 110);
+        assert!(d.is_some());
+        assert!((d.unwrap() - 0.1).abs() < 1e-9, "10/100 = 0.1");
     }
 }
