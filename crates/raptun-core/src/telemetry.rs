@@ -57,19 +57,26 @@ impl LossTracker {
     }
 
     /// Fold in the latest cumulative counters and return the loss rate over the
-    /// interval since the previous call. Returns 0.0 on the first call (only
+    /// interval since the previous call. Returns `None` on the first call (only
     /// establishes a baseline) or any interval with no newly-sent packets.
-    pub fn window_loss(&mut self, sent: u64, lost: u64) -> f64 {
+    ///
+    /// Like [`Self::diag_loss`], the baseline case is exposed as `None` so the
+    /// caller can distinguish "no measurement yet" from a real 0% reading.
+    /// The FEC controller treats a baseline as 0% (assumed no loss until seen),
+    /// which matches the pre-Option behaviour; the operator-facing heartbeat
+    /// skips the `loss_pct` field on baseline ticks so it doesn't display a
+    /// bogus `0.00` that looks like a real reading.
+    pub fn window_loss(&mut self, sent: u64, lost: u64) -> Option<f64> {
         let rate = match self.prev {
-            None => 0.0,
+            None => None,
             Some((ps, pl)) => {
                 // Counters are monotonic; guard against wraparound/reset.
                 let d_sent = sent.saturating_sub(ps);
                 let d_lost = lost.saturating_sub(pl);
                 if d_sent == 0 {
-                    0.0
+                    Some(0.0)
                 } else {
-                    (d_lost as f64 / d_sent as f64).clamp(0.0, 1.0)
+                    Some((d_lost as f64 / d_sent as f64).clamp(0.0, 1.0))
                 }
             }
         };
@@ -240,20 +247,23 @@ mod tests {
     #[test]
     fn loss_tracker_is_windowed_not_cumulative() {
         let mut t = LossTracker::new();
-        // First call has no prior baseline → 0.
-        assert_eq!(t.window_loss(1000, 500), 0.0);
+        // First call has no prior baseline → None.
+        assert_eq!(t.window_loss(1000, 500), None);
         // Next interval: 100 more sent, 4 more lost ⇒ 4% for THIS window,
         // even though the cumulative ratio is 504/1100 ≈ 46%.
         let w = t.window_loss(1100, 504);
+        assert!(w.is_some(), "second call must produce a rate");
         assert!(
-            (w - 0.04).abs() < 1e-9,
-            "windowed loss should be 4%, got {w}"
+            (w.unwrap() - 0.04).abs() < 1e-9,
+            "windowed loss should be 4%, got {w:?}"
         );
-        // A clean interval reports ~0 regardless of the ugly cumulative history.
+        // A clean interval reports Some(0.0) (a real "no loss in this
+        // window" reading, NOT a missing-baseline artifact).
         let w2 = t.window_loss(1200, 504);
         assert_eq!(
-            w2, 0.0,
-            "a loss-free window must read 0, not the cumulative rate"
+            w2,
+            Some(0.0),
+            "a loss-free window must be Some(0.0), not None or the cumulative rate"
         );
     }
 
@@ -261,10 +271,11 @@ mod tests {
     fn loss_tracker_handles_no_new_packets_and_reset() {
         let mut t = LossTracker::new();
         t.window_loss(500, 10);
-        // No new packets sent this interval ⇒ 0 (avoid div-by-zero).
-        assert_eq!(t.window_loss(500, 10), 0.0);
+        // No new packets sent this interval ⇒ Some(0.0) (avoid div-by-zero,
+        // distinct from the baseline None case).
+        assert_eq!(t.window_loss(500, 10), Some(0.0));
         // Counter reset (e.g. reconnect) must not panic or go negative.
-        assert_eq!(t.window_loss(5, 1), 0.0);
+        assert_eq!(t.window_loss(5, 1), Some(0.0));
     }
 
     #[test]

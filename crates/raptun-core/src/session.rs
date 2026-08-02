@@ -319,7 +319,14 @@ pub async fn recv_datagram(conn: &Connection) -> Result<Bytes> {
 pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> TransportSample {
     let stats = conn.stats();
     let path = stats.path;
-    let loss_rate = tracker.window_loss(path.sent_packets, path.lost_packets);
+    // `window_loss` returns `None` on the first call (only establishes a
+    // baseline) or when no new packets have been sent in the window. Treat
+    // both as 0% for the sample: the FEC controller's default "no loss seen
+    // yet, assume no loss" is the right behaviour for a 0-sent-window, and
+    // matches the pre-Option semantics.
+    let loss_rate = tracker
+        .window_loss(path.sent_packets, path.lost_packets)
+        .unwrap_or(0.0);
 
     // 诊断:当窗口丢包率 > 5% 且通过节流时,打印 Quinn 计数器的来源分解,
     // 用来区分"真实丢包"与"指标误判"。三条判据:

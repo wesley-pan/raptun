@@ -344,20 +344,45 @@ fn spawn_client_heartbeat(
         // Skip the immediate first tick so the heartbeat doesn't fire at t=0
         // right after the startup logs.
         ticker.tick().await;
+        // Skip the `loss_pct` field on the first real tick: the per-connection
+        // `window_loss` baseline is set by the first caller (often a per-tunnel
+        // task that runs at 20ms, long before the heartbeat's 1s tick), so
+        // the baseline-call detection inside `read_telemetry` rarely fires from
+        // the heartbeat. Track first-tick here so the operator never sees a
+        // misleading `0.00` on the very first heartbeat line.
+        let mut first_tick = true;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // First tick: only the post-baseline `loss_pct` is
+                    // unreliable (the 20ms-cadenced `window_loss` baseline
+                    // may be set by a per-tunnel task rather than the
+                    // heartbeat, so the literal-first-call detection in
+                    // `read_telemetry` doesn't apply). Skip the `loss_pct`
+                    // field on the first tick so the operator never sees a
+                    // potentially-misleading `0.00`; rtt / cwnd / tunnel
+                    // count are always meaningful.
                     let sample = crate::session::read_telemetry(
                         &conn,
                         &mut *conn_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
-                    tracing::info!(
-                        rtt_ms = sample.smoothed_rtt.as_millis(),
-                        cwnd_bytes = sample.cwnd_bytes,
-                        loss_pct = format!("{:.2}", sample.loss_rate * 100.0),
-                        active_tunnels = active.load(Ordering::Relaxed),
-                        "tunnel alive"
-                    );
+                    if first_tick {
+                        tracing::info!(
+                            rtt_ms = sample.smoothed_rtt.as_millis(),
+                            cwnd_bytes = sample.cwnd_bytes,
+                            active_tunnels = active.load(Ordering::Relaxed),
+                            "tunnel alive (loss_pct=baseline)"
+                        );
+                        first_tick = false;
+                    } else {
+                        tracing::info!(
+                            rtt_ms = sample.smoothed_rtt.as_millis(),
+                            cwnd_bytes = sample.cwnd_bytes,
+                            loss_pct = format!("{:.2}", sample.loss_rate * 100.0),
+                            active_tunnels = active.load(Ordering::Relaxed),
+                            "tunnel alive"
+                        );
+                    }
                 }
                 closed = conn.closed() => {
                     tracing::debug!(reason = %closed, "heartbeat stopping (connection closed)");
@@ -1309,11 +1334,16 @@ async fn run_fec_tunnel(
                 _ = ticker.tick() => {
                     // Refresh telemetry-derived link state + budget ceiling, then
                     // arbitrate stalled blocks and emit NACKs / reliable requests.
+                    // The second tuple element (`is_window_baseline`) is for the
+                    // operator-facing heartbeat and is irrelevant to the FEC
+                    // controller; sample.loss_rate is 0.0 on the baseline tick,
+                    // which is the same default the controller always had.
                     let sample = crate::session::read_telemetry(
                         &down_conn,
                         &mut *down_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
                     let link = classifier.to_link_state(sample);
+                    budget.refresh_ceiling(link.cwnd_bytes());
                     budget.refresh_ceiling(link.cwnd_bytes());
                     // Keep the connection-wide send window sized to the live cwnd
                     // so the sender's flow-control gate tracks link capacity.
