@@ -5,16 +5,92 @@
 > 多路复用 + 可靠传输方案,用 RaptorQ 喷泉码在**不可靠数据报路径**上做主动前向纠错(FEC),
 > 专治高丢包 / 高延迟链路下的尾延迟。
 
-- 版本:v0.2(对齐实现,2026-07-11)
+- 版本:v0.2(对齐实现,2026-07-11;2026-08 增补高层架构图与遥测)
 - 参考实现:[Quinn](https://github.com/quinn-rs/quinn)、[cberner/raptorq](https://github.com/cberner/raptorq)
 - 对标项目:[kcptun](https://github.com/sspanel/kcptun)(yamux + KCP 架构)
 
 本文档是 Raptun 的**唯一权威设计文档**,已对齐 `crates/` 下的可编译实现;凡与代码不一致处以代码为准,尚未实现的能力明确标注为"路线图项"。构建/编译说明见 [`BUILD.md`](BUILD.md)。
 
+## 0. 高层架构
+
+### 0.1 系统位置
+
+Raptun 是一条**单 QUIC 连接上的多路复用隧道**:一台机器上成百上千条本地 TCP / SOCKS5 连接被合并到一条 QUIC 连接里,远端再拆开转发到目标服务。系统上下文中,Raptun 是 local 应用与 remote 应用之间透明的一层:
+
+```mermaid
+graph LR
+  subgraph Left[Local host]
+    LA[Local TCP / SOCKS5 apps]
+  end
+  subgraph Client[Raptun client process]
+    CA[TCP/SOCKS5 acceptor]
+    CT[Per-tunnel task × N]
+  end
+  subgraph QUIC[QUIC connection - shared by all N tunnels]
+    direction TB
+    CS[Control bi-stream #0<br/>handshake, PSK, FEC params]
+    DS[Unreliable datagram path<br/>RaptorQ symbols]
+    SS[Per-tunnel signaling bi-stream × N<br/>NACK, ReliableRequest, ReliableData, BlockAck, Credit]
+  end
+  subgraph Server[Raptun server process]
+    ST[Per-tunnel task × N]
+    TF[TCP target forwarder]
+  end
+  subgraph Right[Remote host]
+    RA[Target TCP service]
+  end
+
+  LA -->|TCP| CA --> CT
+  CT <-.control.-> CS
+  CT <-.datagrams.-> DS
+  CT <-.signaling.-> SS
+  SS <-.-> ST
+  DS <-.-> ST
+  ST --> TF -->|TCP| RA
+  ST <-.control.-> CS
+```
+
+要点:
+- **所有 N 条 TCP 隧道共用一条 QUIC 连接**(不按连接分片,避免指数级密钥 / 握手开销);该连接上承载三类流量:控制流、不可靠数据报流、每隧道独立信令流。
+- **client/server 是镜像**:都跑 `raptun-core`,入口分别是 acceptor 和 forwarder;它们在协议层完全对称。
+- 任意一端掉线 / 切换 IP / 触发 `stall` 终止 → 整条 QUIC 连接的 per-tunnel 任务由 `JoinSet::Drop` 一并 `abort`,然后 client 的监督循环按指数退避重拨。这是单一连接多路复用的代价,也是简化运维的收益。
+
+### 0.2 Workspace 拓扑(5 个 crate)
+
+依赖方向自顶向下、**无环**:叶子 (`proto`) 不依赖任何业务 crate,FEC (`fec`) 之上是 core,core 之上是两个二进制。
+
+```mermaid
+graph TB
+  subgraph Bin[Bin layer]
+    direction LR
+    RC[raptun-client<br/>TCP/SOCKS5 acceptor + CLI]
+    RS[raptun-server<br/>target forwarder + TUI monitor]
+  end
+  C[raptun-core<br/>Quinn / TLS / Session /<br/>per-conn LossTracker / Telemetry]
+  F[raptun-fec<br/>RaptorQ encoder + decoder +<br/>BlockManager + RepairBudget +<br/>FecStrategy]
+  P[raptun-proto<br/>control message codec +<br/>datagram SymbolHeader +<br/>wire Encode/Decode traits]
+
+  Bin --> C
+  C --> F
+  C --> P
+  F --> P
+```
+
+| Crate | 角色 | 关键文件 |
+|---|---|---|
+| `raptun-proto` | 叶子:只定义 wire format 与 codec trait,不依赖任何业务 crate | `src/control.rs`(控制消息枚举)、`src/datagram.rs`(`SymbolHeader` 20 字节)、`src/codec.rs`(`Encode`/`Decode` trait + `bitflags_lite!` 宏) |
+| `raptun-fec` | RaptorQ 封装:编码器、块状态机、维修预算、自适应策略;**纯状态机,无 socket 依赖** | `encoder.rs` / `decoder.rs`(`BlockManager`)、`strategy.rs`、`budget.rs`、`link.rs` |
+| `raptun-core` | Quinn/TLS 设置、Session 管理、跨 tick 拥塞分类、两路径连接管理;**两个 binary 都只依赖本 crate** | `run.rs`(顶层 `run_client` / `run_server`)、`session.rs`、`fec.rs`(`DatagramHub`)、`endpoint.rs`、`tls.rs`、`telemetry.rs` |
+| `raptun-client` | 本地 TCP/SOCKS5 acceptor + CLI;做监督循环(连接掉线 → 指数退避重拨) | `src/main.rs` / `src/cli.rs` |
+| `raptun-server` | 目标 TCP 转发 + CLI + TUI monitor | `src/main.rs` / `src/cli.rs` / `src/monitor_ui.rs` |
+
+`fec.rs` 之所以放在 `raptun-core` 而不是 `raptun-fec`:它负责"把多个 tunnel 复用到一条 QUIC datagram 流"(per-stream `HubGuard` + 单连接 `DatagramHub` + 启动 race 的 pending 缓冲 + per-route 背压),本质是传输层多路复用,不是 RaptorQ 数学;但 `FecSender` / `FecReceiver` 来自 `raptun-fec`,所以 `fec.rs` 同时调两边。
+
 ---
 
 ## 目录
 
+- [0. 高层架构](#0-高层架构)
 - [1. 设计动机](#1-设计动机)
 - [2. 总体架构](#2-总体架构)
 - [3. 核心决策:FEC 加在哪一层](#3-核心决策fec-加在哪一层)
@@ -29,6 +105,7 @@
 - [12. 参数详解](#12-参数详解)
 - [13. 性能与容量规划](#13-性能与容量规划)
 - [14. 实施路线图](#14-实施路线图)
+  - [14.1 关键不变量(代码 review 必读)](#141-关键不变量代码-review-必读)
 - [15. 风险与已知限制](#15-风险与已知限制)
 - [16. 与 kcptun 对照总结](#16-与-kcptun-对照总结)
 - [17. 附录:术语与参考](#17-附录术语与参考)
@@ -587,10 +664,26 @@ pub trait RaptorQBlockDecoder {
 | **3 NACK 控制环 + 自适应** | control tick 接 `stats()`,刷新预算、仲裁、发 NACK、补 repair;区分随机 vs 拥塞 | ✅ 已完成(闭环单测 + `test-hooks` 端到端) |
 | **3b 可靠重传降级(收敛下界)** | `ReliableRequest`/`ReliableData` + 保留块 payload + 序进度 / 硬期限判据 | ✅ 已完成(零预算单测 + `test-hooks` 不可恢复丢包端到端) |
 | **★ 极端网络关卡** | 30% 丢包 + 150ms 抖动 + 25% 乱序三重叠加 | ✅ 已完成(`tests/netem.rs` 进程内 + `netem_bench.sh` 真机) |
-| **4 生产化** | 证书持久化 / 鉴权 / 配置 / CLI 完善 + 连接迁移 + 压测画像 | 🟡 部分完成 |
+| **3c 1000 隧道压测与遥测修正** | 2026-08-02 loopback 1000-tunnel 压测(`docs/loadtest-2026-08-02-1000tunnels.md`)。发现 B1:`LossTracker::diag_loss` 首调用返回 0.0(baseline)被误当作真值打印;且 `LossTracker` 按 tunnel 创建导致每个新 tunnel 都设一次基线,丢包率被假 0.00 淹没。修复:`diag_loss` / `window_loss` 改返 `Option<f64>`,`None` 表示基线;`LossTracker` 提升到**每连接**共享(`Arc<Mutex<>>`),整连接只设一次基线;heartbeat 在首 tick 跳过 `loss_pct` 字段,改打 `(loss_pct=baseline)`。PR #24 合并 | ✅ 已完成(54/54 单测 + 30 s loopback 复测:误报 `0.00` 行从百行降为 0) |
+| **4 生产化** | 证书持久化 / 鉴权 / 配置 / CLI 完善 + 连接迁移 + 压测画像 + 每流公平调度 | 🟡 部分完成 |
 | **5 可选** | QUIC 指纹混淆抗主动探测 | 未开始 |
 
 > **最大风险**:RaptorQ 实时编解码在小 block + 高吞吐下的性能(低延迟场景 K 必须小,GF(256) 高斯消元相对开销上升)。若顶不住,给"极低延迟档"配 `--fec xor` 作为可选路径。
+
+### 14.1 关键不变量(代码 review 必读)
+
+这些是当前实现里**不能随意改**的硬约束,改了大概率破坏正确性或性能:
+
+| 不变量 | 出处 | 数值/含义 |
+|---|---|---|
+| **每连接一个 `RepairBudget`** | `run.rs::serve_connection` 注释 + 工厂函数 | N 条隧道若各自持 40% cwnd 的预算,合计 = N × 40% × cwnd,把链路打爆。所有 tunnel 共享同一份预算 |
+| **每连接一个 `SendWindow`** | `run.rs::new_conn_send_window` | 同一原因;in-flight data 块总量也按 cwnd 上限 |
+| **每连接一个 `DatagramHub`,pending 上限 1024 streams × 256 symbols** | `fec.rs::DatagramHub` 常量 | 8-byte stream_id 空间过大,无上限会被攻击者撑爆;`HubGuard` 在 `Drop` 中 `unregister`(M2 修复防 panic 泄漏) |
+| **每连接一个 `LossTracker`**,跨 tunnel 共享 | `run.rs::serve_connection` + `run_fec_tunnel` 形参 | 修复 B1:每 tunnel 各自一份 tracker 会导致首个 diagnostic 总是 0.0 baseline,真实丢包率被淹没 |
+| **`TUNNEL_MAX_STALL = 120 s` 硬截止** | `run.rs` 常量 + 触发时的 `stalled: aborting` 日志 | "卡住" = 长时间无 in-flight progress;非"绝对年龄"。健康长连接不会被裁 |
+| **`SAFE_MAX_SYMBOL_SIZE = 1100`** | `session.rs` 常量 | 符号 + 20 B 头必须塞进一个 QUIC datagram;MTU 1350 路径可用空间 ≈ 1150-1200 |
+| **QUIC stream_id 偶数序列 (`NEXT_STREAM_ID 起步 2`)** | `run.rs` 常量 | 偶数留给 client-originated tunnel,留出奇数给未来 server-originated,防冲突 |
+| **NACK / ReliableRequest 限"每块一次"** | `fec.rs::FecReceiver::tick` 的 `reliable_requested: HashSet` | 不去重会每个 tick 重复请求,放大降级流量 |
 
 ---
 
@@ -605,6 +698,8 @@ pub trait RaptorQBlockDecoder {
 | 降级重传传整块 | 重丢时可靠通道重传整块(含已收部分),带宽非最优 | 可优化为只传缺口子集(路线图) |
 | 硬期限用绝对时间 | 极慢链路(RTT 秒级)可能偏早触发降级 | 让期限随 RTT 缩放(路线图) |
 | 块间保序内存开销 | 高并发大量逻辑连接时重组缓冲占内存 | 设缓冲上限 + 背压,纳入 Phase 4 压测 |
+| **单 QUIC 连接 × N 条胖流** | 一条 cwnd 给所有 tunnel 共享,高并发下每流带宽 = cwnd/N | 1000+ tunnel 时,即便 cwnd 健康,每流也只拿到几 KB/s;考虑按 `stream_id` 做 per-flow 公平调度(Phase 4) |
+| **丢包 + 高 jitter 放大 QUIC 误判** | 50 ms jitter 是 10 ms RTT 的 5×,QUIC 误把延迟 ACK 当丢包,丢包率从 5% 涨到 30-37% | 这是 QUIC 协议行为,链接层解决(QoS / traffic shaping),非 tunnel 可改 |
 
 ---
 
