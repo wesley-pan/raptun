@@ -82,18 +82,24 @@ impl LossTracker {
     /// diagnostic (i.e. right after `allow_diag` returns true): unlike
     /// `window_loss`, whose 20 ms cadence gives a tiny, noisy denominator, this
     /// spans the full ~2 s diagnostic interval, so the logged figure reflects
-    /// the link over the window the log line actually represents. Returns 0.0
-    /// on the first diagnostic (baseline only) or a window with no new packets.
-    pub(crate) fn diag_loss(&mut self, sent: u64, lost: u64) -> f64 {
+    /// the link over the window the log line actually represents.
+    ///
+    /// Returns `None` on the first diagnostic (baseline only — no measurement
+    /// yet) or `Some(rate)` otherwise (the rate is 0.0 for an interval with no
+    /// newly-sent packets, which is a real "nothing happened" reading, not a
+    /// missing baseline). The `Option` exists to make the baseline-vs-measurement
+    /// distinction explicit to the caller; logging a baseline 0.0 as a real
+    /// `loss_pct` reading misleads operators (regression test: `diag_loss_is_none_on_baseline`).
+    pub(crate) fn diag_loss(&mut self, sent: u64, lost: u64) -> Option<f64> {
         let rate = match self.diag_prev {
-            None => 0.0,
+            None => None,
             Some((ps, pl)) => {
                 let d_sent = sent.saturating_sub(ps);
                 let d_lost = lost.saturating_sub(pl);
                 if d_sent == 0 {
-                    0.0
+                    Some(0.0)
                 } else {
-                    (d_lost as f64 / d_sent as f64).clamp(0.0, 1.0)
+                    Some((d_lost as f64 / d_sent as f64).clamp(0.0, 1.0))
                 }
             }
         };
@@ -268,12 +274,39 @@ mod tests {
         t.window_loss(1000, 100);
         t.window_loss(1010, 110); // last tick: 10 lost / 10 sent = 100% (noise)
                                   // First diagnostic only establishes the diag baseline.
-        assert_eq!(t.diag_loss(1010, 110), 0.0);
+        assert_eq!(t.diag_loss(1010, 110), None);
         // More 20ms ticks, then the next diagnostic ~2s later: 1000 sent,
         // 40 lost across the whole interval ⇒ 4%, NOT the 100% a single tick saw.
         t.window_loss(1500, 130);
         t.window_loss(2010, 150);
         let d = t.diag_loss(2010, 150);
-        assert!((d - 0.04).abs() < 1e-9, "diag loss should be 4%, got {d}");
+        assert!(d.is_some(), "second diagnostic must produce a rate");
+        assert!(
+            (d.unwrap() - 0.04).abs() < 1e-9,
+            "diag loss should be 4%, got {d:?}"
+        );
+    }
+
+    /// B1 regression: first `diag_loss` is a baseline, not a measurement.
+    /// Pre-fix, this returned `Some(0.0)` which the caller logged as a real
+    /// `loss_pct=0.00`. With 1000+ per-tunnel trackers each setting their own
+    /// baseline, this hid the actual 30-37% loss observed in the 2026-08-02
+    /// load test. The fix is to return `None` on the baseline call so the
+    /// caller can skip the log.
+    #[test]
+    fn diag_loss_is_none_on_baseline() {
+        let mut t = LossTracker::new();
+        // First call: no prior diag_prev → baseline only.
+        assert_eq!(
+            t.diag_loss(1000, 100),
+            None,
+            "baseline-only diagnostic must return None, not Some(0.0)"
+        );
+        // Real reading with 0 newly-lost is Some(0.0), not None.
+        assert_eq!(t.diag_loss(1010, 100), Some(0.0));
+        // Real loss rate after that.
+        let d = t.diag_loss(1110, 110);
+        assert!(d.is_some());
+        assert!((d.unwrap() - 0.1).abs() < 1e-9, "10/100 = 0.1");
     }
 }
