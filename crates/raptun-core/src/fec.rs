@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -491,6 +492,12 @@ pub struct FecSender {
     /// Lowest block id still retained; the low-water edge of the retention
     /// window, advanced as old blocks are evicted so eviction stays O(evicted).
     oldest_retained: BlockId,
+    /// When each retained block was first emitted. Used by proactive repair
+    /// spurts to identify blocks that have not been acknowledged after one RTT.
+    block_sent_at: HashMap<BlockId, Instant>,
+    /// How many proactive top-ups have been issued per retained block. Capped
+    /// so proactive spurts do not infinite-loop before the NACK path takes over.
+    proactive_counts: HashMap<BlockId, u32>,
 }
 
 /// Upper bound on the *bytes* of source data a sender retains for possible NACK
@@ -506,6 +513,12 @@ pub struct FecSender {
 /// by bytes keeps the worst case predictable regardless of concurrency.
 const SENDER_RETAIN_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Maximum number of proactive repair spurts a single block may receive. After
+/// this cap the sender stops主动补喷 for that block and lets the receiver's
+/// NACK / ReliableRequest path take over. This bounds bandwidth and avoids
+/// outrunning a genuinely stalled receiver.
+const PROACTIVE_TOPUP_CAP: u32 = 3;
+
 impl FecSender {
     pub fn new(stream_id: StreamId, symbol_size: u16, k: u32) -> Self {
         Self {
@@ -517,6 +530,8 @@ impl FecSender {
             encoders: HashMap::new(),
             payloads: HashMap::new(),
             oldest_retained: 0,
+            block_sent_at: HashMap::new(),
+            proactive_counts: HashMap::new(),
         }
     }
 
@@ -562,6 +577,9 @@ impl FecSender {
         self.encoders.insert(block_id, encoder);
         // Retain the raw payload for a possible reliable-retransmit fallback.
         self.payloads.insert(block_id, payload.to_vec());
+        // Record when this block was first sent. Proactive top-ups use this to
+        // identify blocks that have not been acknowledged after one RTT.
+        self.block_sent_at.insert(block_id, Instant::now());
 
         // Bound memory on long-lived connections: retire blocks that have fallen
         // more than SENDER_RETAIN_BLOCKS behind the send frontier. Without this,
@@ -585,6 +603,8 @@ impl FecSender {
             self.encoders.remove(&block_id);
             self.repair_sent.remove(&block_id);
             self.payloads.remove(&block_id);
+            self.block_sent_at.remove(&block_id);
+            self.proactive_counts.remove(&block_id);
         }
         self.oldest_retained = self.oldest_retained.max(cutoff);
     }
@@ -613,6 +633,58 @@ impl FecSender {
         self.encoders.remove(&block_id);
         self.repair_sent.remove(&block_id);
         self.payloads.remove(&block_id);
+        self.block_sent_at.remove(&block_id);
+        self.proactive_counts.remove(&block_id);
+    }
+
+    /// Return blocks that should receive a proactive repair spurt.
+    ///
+    /// A block is eligible if it has been retained, has not been acknowledged,
+    /// was first sent more than `rtt` ago, and the link is not congestion-
+    /// limited. For each eligible block this reserves repair budget and bumps
+    /// the per-block proactive counter, returning the `(block_id, extra_symbols)`
+    /// pairs the caller should emit via [`Self::additional_repair`].
+    pub fn proactive_topups(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+        budget: &raptun_fec::RepairBudget,
+        link: &raptun_fec::LinkState,
+    ) -> Vec<(BlockId, u32)> {
+        use raptun_fec::link::LossRegime;
+
+        // Only top up when the link actually shows random loss. In the
+        // Quiescent regime (negligible loss) extra repair is pure waste and
+        // can fill the send buffer, stalling large transfers on clean links.
+        // In Congestion, adding redundancy deepens the collapse.
+        if !matches!(link.regime(), LossRegime::Random) {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        // Conservative extra amount: enough to push a block toward decode but
+        // not so large that a single spurt can exhaust the repair budget.
+        let desired = (self.k / 4).max(1);
+
+        for (&block_id, &sent_at) in &self.block_sent_at {
+            // The encoder must still be retained (BlockAck retires it).
+            if !self.encoders.contains_key(&block_id) {
+                continue;
+            }
+            if now.duration_since(sent_at) <= rtt {
+                continue;
+            }
+            let count = *self.proactive_counts.get(&block_id).unwrap_or(&0);
+            if count >= PROACTIVE_TOPUP_CAP {
+                continue;
+            }
+            if !budget.try_reserve(desired) {
+                continue;
+            }
+            *self.proactive_counts.entry(block_id).or_insert(0) = count + 1;
+            out.push((block_id, desired));
+        }
+        out
     }
 }
 
@@ -1452,5 +1524,155 @@ mod tests {
             Ok((sig, _)) => panic!("unexpected Ok signal: {sig:?}"),
             Err(n) => assert_eq!(n, 1, "drop just the tag byte"),
         }
+    }
+
+    /// M3: proactive repair spurts top up blocks that have not been acknowledged
+    /// after one RTT, without waiting for a NACK round-trip.
+    #[test]
+    fn proactive_topups_fire_after_rtt_and_skip_before() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload: Vec<u8> = (0..400).map(|i| (i % 200) as u8).collect();
+        sender.encode_one_block(&payload, 0);
+
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(10_000_000);
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.1,
+            10_000_000,
+            LossRegime::Random,
+        );
+        let rtt = Duration::from_millis(20);
+
+        // Just sent: age < RTT, so no proactive top-up.
+        let now = Instant::now();
+        assert!(sender.proactive_topups(now, rtt, &budget, &link).is_empty());
+
+        // One RTT later: eligible.
+        let later = now + rtt + Duration::from_millis(1);
+        let tops = sender.proactive_topups(later, rtt, &budget, &link);
+        assert_eq!(tops.len(), 1);
+        assert_eq!(tops[0].0, 0);
+        assert_eq!(tops[0].1, (K / 4).max(1));
+    }
+
+    /// M3: proactive repair is suppressed under congestion so it cannot deepen a
+    /// collapse.
+    #[test]
+    fn proactive_topups_skip_congestion() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload = vec![0xABu8; 100];
+        sender.encode_one_block(&payload, 0);
+
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(10_000_000);
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.1,
+            10_000_000,
+            LossRegime::Congestion,
+        );
+        let now = Instant::now() + Duration::from_secs(1);
+        assert!(sender
+            .proactive_topups(now, Duration::from_millis(20), &budget, &link)
+            .is_empty());
+    }
+
+    /// M3: proactive repair is also suppressed in the Quiescent regime. On a
+    /// clean link extra repair symbols are pure waste and can back-pressure the
+    /// send buffer, so the sender stays quiet until loss is observed.
+    #[test]
+    fn proactive_topups_skip_quiescent() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload = vec![0xABu8; 100];
+        sender.encode_one_block(&payload, 0);
+
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(10_000_000);
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.0,
+            10_000_000,
+            LossRegime::Quiescent,
+        );
+        let now = Instant::now() + Duration::from_secs(1);
+        assert!(sender
+            .proactive_topups(now, Duration::from_millis(20), &budget, &link)
+            .is_empty());
+    }
+
+    /// M3: the per-block proactive counter caps spurts so the sender does not
+    /// infinite-loop before the NACK path takes over.
+    #[test]
+    fn proactive_topups_honour_per_block_cap() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload = vec![0xCDu8; 100];
+        sender.encode_one_block(&payload, 0);
+
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(10_000_000);
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.1,
+            10_000_000,
+            LossRegime::Random,
+        );
+        let rtt = Duration::from_millis(20);
+
+        for i in 0..(PROACTIVE_TOPUP_CAP + 2) {
+            let now = Instant::now() + rtt + Duration::from_millis(i as u64);
+            sender.proactive_topups(now, rtt, &budget, &link);
+        }
+        assert_eq!(
+            sender.proactive_counts.get(&0).copied().unwrap_or(0),
+            PROACTIVE_TOPUP_CAP
+        );
+    }
+
+    /// M3: a zero repair budget prevents proactive spurts, letting the NACK /
+    /// degraded path handle recovery.
+    #[test]
+    fn proactive_topups_respect_budget() {
+        use raptun_fec::link::{LinkState, LossRegime};
+        use raptun_fec::RepairBudget;
+        use std::time::Duration;
+
+        let mut sender = FecSender::new(1, SYM, K);
+        let payload = vec![0xEFu8; 100];
+        sender.encode_one_block(&payload, 0);
+
+        let budget = RepairBudget::new(SYM, 0.4);
+        budget.refresh_ceiling(0); // ceiling 0 ⇒ nothing fits
+        let link = LinkState::new(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            0.1,
+            0,
+            LossRegime::Random,
+        );
+        let now = Instant::now() + Duration::from_secs(1);
+        assert!(sender
+            .proactive_topups(now, Duration::from_millis(20), &budget, &link)
+            .is_empty());
     }
 }
