@@ -1,0 +1,43 @@
+# Raptun server production configuration.
+#
+# Installed to: /etc/raptun/raptun-server.toml
+# Precedence:   CLI flag > environment variable > this file > built-in default
+
+listen = "0.0.0.0:29900"
+target = "127.0.0.1:8080"      # forward tunnelled TCP here
+
+# PSK is read from the environment so it never lives in plaintext on disk.
+# Set it in /etc/raptun/env (see install.sh).
+psk         = "env:RAPTUN_PSK"
+client_auth = "psk"             # none | psk | mtls
+
+# TLS identity: self-signed certificate generated at each startup.
+# The server prints its fingerprint on boot; clients pin it via --fingerprint.
+# To use a CA-issued cert instead, replace these two lines with:
+#   cert = "/etc/raptun/server.pem"
+#   key  = "/etc/raptun/server-key.pem"
+self_signed = true
+
+max_conns = 4096
+log_level = "info"              # error | warn | info | debug | trace
+# metrics = "127.0.0.1:9100"   # Prometheus scrape endpoint (uncomment to enable)
+
+[fec]
+scheme      = "raptorq"
+max         = 0.50
+symbol_size = 1200              # must match clients
+
+[transport]
+cc              = "bbr"
+mtu             = 1350          # must match clients
+datagram        = true
+stream_rwnd     = 2097152       # 2 MiB
+conn_rwnd       = 16777216      # 16 MiB
+max_streams     = 1024
+sockbuf         = 4194304       # 4 MiB UDP socket buffer
+keepalive       = 10
+idle_timeout    = 30
+connect_timeout = 10
+migration       = true
+zero_rtt        = true
+dscp            = 0
