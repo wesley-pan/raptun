@@ -229,6 +229,14 @@ fn clamp_fec(requested: &FecParams, config: &RuntimeConfig) -> FecParams {
     // Symbol size is fixed by the server so both ends frame identically, and is
     // clamped to a size guaranteed to fit in one QUIC datagram.
     let symbol_size = config.fec.symbol_size.min(SAFE_MAX_SYMBOL_SIZE);
+    if symbol_size < requested.symbol_size {
+        tracing::warn!(
+            requested = requested.symbol_size,
+            effective = symbol_size,
+            max_safe = SAFE_MAX_SYMBOL_SIZE,
+            "clamping client-requested symbol_size; larger values would be silently dropped by send_datagram",
+        );
+    }
     // Clamp block_size too: a client-requested u16 = 65535 forces the sender
     // to allocate ~78 MB per block and the per-tunnel retention cap stops
     // applying. Capped silently to MAX_BLOCK_SIZE (the HelloAck echoes the

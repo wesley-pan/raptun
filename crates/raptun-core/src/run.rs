@@ -973,17 +973,32 @@ async fn run_fec_tunnel(
         let mut sig_send = sig_send;
         while let Some(sig) = sig_rx.recv().await {
             let bytes = sig.encode();
-            if let Err(e) = sig_send.write_all(&bytes).await {
-                // Surface the cause: previously this was a bare `is_err() { break }`
-                // and the *only* signal in the log was the peer reset the
-                // reader observed later. Operators had no way to tell whether
-                // the channel failed because of back-pressure, a closed
-                // connection, or a framing error on our side (H5).
-                tracing::warn!(
-                    error = %e,
-                    "signaling writer failed; closing the channel"
-                );
-                break;
+            match sig_send.write_all(&bytes).await {
+                Ok(()) => {}
+                // Stopped(0) is the peer's graceful "I'm done reading" — the
+                // normal end-of-life of a tunnel, not a failure. Demoted to
+                // debug: at 100+ active tunnels this fires on every teardown
+                // and drowns the operator log; real failures still surface
+                // as warn below.
+                Err(quinn::WriteError::Stopped(code))
+                    if code == quinn::VarInt::from_u32(0) =>
+                {
+                    tracing::debug!(
+                        code = %code,
+                        "signaling stream closed by peer (EOF); closing the channel"
+                    );
+                    break;
+                }
+                // Other write failures (backpressure, connection lost,
+                // framing error, non-zero stop code) — surface as warn so
+                // operators can distinguish them from normal EOF (H5).
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "signaling writer failed; closing the channel"
+                    );
+                    break;
+                }
             }
         }
         let _ = sig_send.finish();
