@@ -7,9 +7,9 @@
 //! the accept/forward structure here.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -161,6 +161,11 @@ async fn serve_connection(
     // every 2 s globally).
     let conn_loss_tracker: Arc<Mutex<crate::telemetry::LossTracker>> =
         Arc::new(Mutex::new(crate::telemetry::LossTracker::new()));
+    // Latest LinkState snapshot computed by the downstream task, shared with the
+    // upstream task so proactive repair spurts can be gated on the live loss
+    // regime (M3). Written once per 20 ms control tick; read once per proactive
+    // tick (RTT/4). One cell per connection, not per tunnel.
+    let conn_link_state: Arc<Mutex<Option<raptun_fec::LinkState>>> = Arc::new(Mutex::new(None));
     if let Some(interval) = config.transport.heartbeat {
         spawn_client_heartbeat(
             Arc::clone(&conn),
@@ -203,6 +208,7 @@ async fn serve_connection(
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
         let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
+        let conn_link_state = Arc::clone(&conn_link_state);
         tunnels.spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
@@ -216,6 +222,7 @@ async fn serve_connection(
                     &budget,
                     &send_window,
                     &conn_loss_tracker,
+                    &conn_link_state,
                     tcp,
                 )
                 .await
@@ -403,6 +410,7 @@ async fn handle_client_conn(conn: &quinn::Connection, tcp: TcpStream) -> Result<
 }
 
 /// Open a signaling bi-stream and tunnel one local TCP connection over FEC.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_conn_fec(
     conn: &quinn::Connection,
     hub: &DatagramHub,
@@ -410,13 +418,26 @@ async fn handle_client_conn_fec(
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
+    conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
     tcp: TcpStream,
 ) -> Result<()> {
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| CoreError::Endpoint(format!("open signaling bi: {e}")))?;
-    client_tunnel_fec(conn, hub, fec, budget, send_window, conn_loss_tracker, tcp, send, recv).await
+    client_tunnel_fec(
+        conn,
+        hub,
+        fec,
+        budget,
+        send_window,
+        conn_loss_tracker,
+        conn_link_state,
+        tcp,
+        send,
+        recv,
+    )
+    .await
 }
 
 /// Run the server: listen for QUIC connections, run the handshake on each, and
@@ -491,6 +512,9 @@ async fn handle_server_conn(
     // 2026-08-02 load test).
     let conn_loss_tracker: Arc<Mutex<crate::telemetry::LossTracker>> =
         Arc::new(Mutex::new(crate::telemetry::LossTracker::new()));
+    // Latest LinkState snapshot shared from downstream to upstream task (M3).
+    // See the matching comment in `serve_connection`.
+    let conn_link_state: Arc<Mutex<Option<raptun_fec::LinkState>>> = Arc::new(Mutex::new(None));
 
     // M2: same JoinSet pattern as the client. When the connection scope ends
     // (conn closes, accept_bi errors, etc.), the JoinSet's Drop aborts every
@@ -522,6 +546,7 @@ async fn handle_server_conn(
         let budget = Arc::clone(&budget);
         let send_window = Arc::clone(&send_window);
         let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
+        let conn_link_state = Arc::clone(&conn_link_state);
         let registry = registry.clone();
         tunnels.spawn(async move {
             // Bound the target connect: an unreachable target must not park this
@@ -537,6 +562,7 @@ async fn handle_server_conn(
                             &budget,
                             &send_window,
                             &conn_loss_tracker,
+                            &conn_link_state,
                             tcp,
                             send,
                             recv,
@@ -729,6 +755,7 @@ async fn client_tunnel_fec(
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
+    conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
@@ -751,6 +778,7 @@ async fn client_tunnel_fec(
         budget,
         send_window,
         conn_loss_tracker,
+        conn_link_state,
         stream_id,
         tcp,
         sig_send,
@@ -773,6 +801,7 @@ async fn server_tunnel_fec(
     budget: &Arc<raptun_fec::RepairBudget>,
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
+    conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
@@ -826,6 +855,7 @@ async fn server_tunnel_fec(
         budget,
         send_window,
         conn_loss_tracker,
+        conn_link_state,
         stream_id,
         tcp,
         sig_send,
@@ -869,6 +899,11 @@ async fn run_fec_tunnel(
     // (B1 from the 2026-08-02 load test). Lock is held only for the few-line
     // delta math in `read_telemetry`; contention is negligible.
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
+    // Latest LinkState snapshot computed by the downstream task and shared with
+    // the upstream task (M3). Used to gate proactive repair spurts on the live
+    // loss regime. Written once per 20 ms control tick; read once per proactive
+    // tick (RTT/4). One cell per connection, not per tunnel.
+    conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
     stream_id: StreamId,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
@@ -1020,6 +1055,8 @@ async fn run_fec_tunnel(
     let up_conn = conn.clone();
     let up_sig = sig_tx.clone();
     let up_window = Arc::clone(send_window);
+    let up_budget = Arc::clone(budget);
+    let up_link_state = Arc::clone(conn_link_state);
     let up_stats = stats.clone();
     let up = async move {
         let mut down_done_rx = down_done_rx;
@@ -1051,6 +1088,13 @@ async fn run_fec_tunnel(
         // overshoot is 5 s on top of TUNNEL_MAX_STALL.
         let mut lifetime_tick = tokio::time::interval(Duration::from_secs(5));
         lifetime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // M3: proactive repair spurt ticker. Fires every RTT/4 so the sender can
+        // inject additional repair for blocks that have not been acknowledged
+        // after one RTT, without waiting for the receiver's NACK round-trip.
+        // Floor at 10 ms so very low RTT links do not spin the task.
+        let mut proactive_tick =
+            tokio::time::interval((up_conn.rtt() / 4).max(Duration::from_millis(10)));
+        proactive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !eof {
             tokio::select! {
@@ -1157,6 +1201,25 @@ async fn run_fec_tunnel(
                 Some(block) = ack_rx.recv() => {
                     sender.retire_block(block);
                 }
+                // M3: proactive repair spurt. Emit additional repair for blocks
+                // that have not been acknowledged after one RTT, without waiting
+                // for the receiver's NACK round-trip. Gated on the live loss
+                // regime: skipped under congestion so we don't deepen a collapse.
+                _ = proactive_tick.tick() => {
+                    let link = up_link_state.lock().expect("link state poisoned").clone();
+                    if let Some(link) = link {
+                        let rtt = up_conn.rtt();
+                        let now = Instant::now();
+                        for (block, extra) in sender.proactive_topups(now, rtt, &up_budget, &link) {
+                            for dg in sender.additional_repair(block, extra) {
+                                send_datagram_paced(&up_conn, dg).await;
+                            }
+                            if let Some(s) = &up_stats {
+                                s.add_repair(extra);
+                            }
+                        }
+                    }
+                }
                 // Stall bound: abort a tunnel only if it has made no progress
                 // for TUNNEL_MAX_STALL. "Progress" is either delivering a new
                 // block (delivered advanced) or being fully caught up
@@ -1211,6 +1274,23 @@ async fn run_fec_tunnel(
                         let _ = up_sig.send(TunnelSignal::ReliableData { block, bytes });
                     }
                 }
+                // M3: proactive repair continues post-EOF so the final blocks
+                // can recover without waiting for a NACK round-trip.
+                _ = proactive_tick.tick() => {
+                    let link = up_link_state.lock().expect("link state poisoned").clone();
+                    if let Some(link) = link {
+                        let rtt = up_conn.rtt();
+                        let now = Instant::now();
+                        for (block, extra) in sender.proactive_topups(now, rtt, &up_budget, &link) {
+                            for dg in sender.additional_repair(block, extra) {
+                                send_datagram_paced(&up_conn, dg).await;
+                            }
+                            if let Some(s) = &up_stats {
+                                s.add_repair(extra);
+                            }
+                        }
+                    }
+                }
                 // Late BlockAck: the receiver may still be decoding the last
                 // blocks after we've announced BlockCount; retire them so the
                 // sender's retained state is cleaned up. Each ack is also fresh
@@ -1263,6 +1343,7 @@ async fn run_fec_tunnel(
     // task. The shared tracker is owned by `serve_connection` / `handle_server_conn`
     // and lives for the life of the QUIC connection.
     let down_loss_tracker = Arc::clone(conn_loss_tracker);
+    let down_link_state = Arc::clone(conn_link_state);
     let mut classifier = crate::telemetry::RegimeClassifier::new();
     let down = async move {
         let mut inbound = inbound;
@@ -1344,7 +1425,9 @@ async fn run_fec_tunnel(
                     );
                     let link = classifier.to_link_state(sample);
                     budget.refresh_ceiling(link.cwnd_bytes());
-                    budget.refresh_ceiling(link.cwnd_bytes());
+                    // Publish the live regime snapshot for the upstream task's
+                    // proactive repair spurts (M3).
+                    *down_link_state.lock().expect("link state poisoned") = Some(link.clone());
                     // Keep the connection-wide send window sized to the live cwnd
                     // so the sender's flow-control gate tracks link capacity.
                     down_window.refresh_ceiling(link.cwnd_bytes());

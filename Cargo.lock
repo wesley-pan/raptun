@@ -891,7 +891,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptun-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "raptun-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "raptun-fec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "raptorq",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "raptun-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "serde",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "raptun-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

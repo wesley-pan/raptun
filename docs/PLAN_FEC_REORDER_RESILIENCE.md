@@ -6,7 +6,7 @@
 |---|---|---|
 | M2 Quinn 乱序调参 | ✅ 已实现 | cwnd 传输中 2× 提升（77→134KB vs 34→59KB），空闲 cwnd 5.8MB vs 3.3MB，5MB 交付 vs 0B |
 | M1 BlockAck + ACK 驱动释放 | ✅ 已实现 | 信令编解码、drain_acks 接线、retire_block 双向驱动、netem 测试覆盖 |
-| M3 主动冗余喷发 | ⏳ 待实现 | — |
+| M3 主动冗余喷发 | ✅ 已实现 | `FecSender::proactive_topups`、upstream RTT/4 ticker、LinkState 共享、congestion 刹车、单元测试 |
 
 **验证数据**（`stress/run.sh 1 30 100 50 0`，jitter=50ms, loss=0%）：
 - 无 M2：传输 0 字节，cwnd 34–59KB，idle 3.3MB
