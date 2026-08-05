@@ -509,7 +509,12 @@ impl Cli {
         RuntimeConfig {
             fec,
             transport,
-            psk: self.psk.clone(),
+            // Resolve any "env:VAR" prefix on the PSK here so it works
+            // uniformly for CLI, config-file, and `RAPTUN_PSK` env paths.
+            // Previously this only ran on the config-file path
+            // (merge_parsed), so `--psk env:RAPTUN_PSK` on the CLI was
+            // sent literally and `psk_matches` failed on length.
+            psk: self.psk.clone().and_then(resolve_secret),
         }
     }
 }
