@@ -72,6 +72,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub self_signed: bool,
 
+    /// Directory where the self-signed certificate (cert.pem) and private key
+    /// (key.pem) are persisted. Ignored when --cert/--key are used.
+    #[arg(long, default_value = ".raptun")]
+    pub identity_dir: String,
+
     /// Client authentication mode.
     #[arg(long, value_enum, default_value_t = ClientAuth::Psk)]
     pub client_auth: ClientAuth,
@@ -186,6 +191,7 @@ pub struct FileConfig {
     pub cert: Option<String>,
     pub key: Option<String>,
     pub self_signed: Option<bool>,
+    pub identity_dir: Option<String>,
     pub client_auth: Option<String>,
     pub metrics: Option<String>,
     pub pprof: Option<String>,
@@ -299,6 +305,11 @@ impl Cli {
         if from_default("self_signed") {
             if let Some(v) = file.self_signed {
                 self.self_signed = v;
+            }
+        }
+        if from_default("identity_dir") {
+            if let Some(v) = file.identity_dir {
+                self.identity_dir = v;
             }
         }
         if from_default("client_auth") {
@@ -549,5 +560,11 @@ mod tests {
     fn client_auth_enum_parsing() {
         let cli = merged(&["raptun-server"], "client_auth = \"mtls\"\n");
         assert!(matches!(cli.client_auth, ClientAuth::Mtls));
+    }
+
+    #[test]
+    fn identity_dir_from_file() {
+        let cli = merged(&["raptun-server"], "identity_dir = \"/var/lib/raptun\"\n");
+        assert_eq!(cli.identity_dir, "/var/lib/raptun");
     }
 }

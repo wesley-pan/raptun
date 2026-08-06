@@ -15,6 +15,11 @@
 //!   so unauthorized peers can't consume resources, and is checked in the
 //!   [`crate::session`] handshake, not here.
 
+use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -29,6 +34,10 @@ use crate::{CoreError, Result};
 /// ALPN protocol identifier advertised by both ends. Namespacing the tunnel on
 /// its own ALPN keeps it from being confused with HTTP/3 on shared ports.
 pub const ALPN: &[u8] = b"raptun/1";
+
+/// Filenames used inside the self-signed identity directory.
+const CERT_FILE: &str = "cert.pem";
+const KEY_FILE: &str = "key.pem";
 
 /// Ensure a process-wide rustls [`CryptoProvider`] is installed (ring backend).
 ///
@@ -88,6 +97,84 @@ impl ServerIdentity {
             fingerprint_hex,
         })
     }
+
+    /// Load a persisted self-signed identity from `dir`, or generate and persist
+    /// one on first start. Subsequent starts return the same certificate and
+    /// therefore the same fingerprint.
+    pub fn load_or_generate_self_signed(dir: impl AsRef<Path>, sni: &str) -> Result<Self> {
+        let dir = dir.as_ref();
+        let cert_path = dir.join(CERT_FILE);
+        let key_path = dir.join(KEY_FILE);
+
+        if cert_path.exists() && key_path.exists() {
+            let cert_pem = fs::read(&cert_path)?;
+            let key_pem = fs::read(&key_path)?;
+            let id = Self::load_pem(&cert_pem, &key_pem)?;
+            tracing::info!(
+                dir = %dir.display(),
+                fingerprint = %id.fingerprint_hex,
+                "loaded persisted self-signed identity"
+            );
+            return Ok(id);
+        }
+
+        if cert_path.exists() || key_path.exists() {
+            return Err(CoreError::Tls(format!(
+                "inconsistent identity directory {}: only one of {} or {} exists; \
+                 remove both files to rotate manually",
+                dir.display(),
+                cert_path.display(),
+                key_path.display()
+            )));
+        }
+
+        fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let certified = rcgen::generate_simple_self_signed(vec![sni.to_string()])
+            .map_err(|e| CoreError::Tls(format!("rcgen: {e}")))?;
+        let cert_pem = certified.cert.pem();
+        let key_pem = certified.key_pair.serialize_pem();
+
+        write_identity_file(&cert_path, cert_pem.as_bytes(), 0o644)?;
+        write_identity_file(&key_path, key_pem.as_bytes(), 0o600)?;
+
+        let id = Self::load_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+        tracing::info!(
+            dir = %dir.display(),
+            fingerprint = %id.fingerprint_hex,
+            "generated and persisted new self-signed identity"
+        );
+        Ok(id)
+    }
+}
+
+/// Atomically write an identity file and set restrictive permissions.
+fn write_identity_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let tmp_name = format!("{}.tmp", path.file_name().unwrap_or_default().to_string_lossy());
+    let tmp = path.with_file_name(tmp_name);
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+
+    fs::rename(&tmp, path)?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 /// Compute the `SHA256:<hex>` fingerprint of a DER certificate, matching the
@@ -364,5 +451,26 @@ mod tests {
         assert!(client_config(&ServerTrust::Insecure, false).is_ok());
         assert!(client_config(&ServerTrust::Insecure, true).is_ok());
         assert!(server_config(&id).is_ok());
+    }
+
+    #[test]
+    fn self_signed_identity_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = ServerIdentity::load_or_generate_self_signed(dir.path(), "raptun.test").unwrap();
+
+        assert!(dir.path().join(CERT_FILE).exists());
+        assert!(dir.path().join(KEY_FILE).exists());
+        assert!(id1.fingerprint_hex.starts_with("SHA256:"));
+
+        let id2 = ServerIdentity::load_or_generate_self_signed(dir.path(), "raptun.test").unwrap();
+        assert_eq!(id1.fingerprint_hex, id2.fingerprint_hex);
+        assert_eq!(id1.cert_chain.len(), id2.cert_chain.len());
+    }
+
+    #[test]
+    fn partial_identity_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(CERT_FILE), b"not-a-real-cert").unwrap();
+        assert!(ServerIdentity::load_or_generate_self_signed(dir.path(), "raptun.test").is_err());
     }
 }

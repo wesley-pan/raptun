@@ -33,3 +33,4 @@ test-hooks = []
 tracing-subscriber.workspace = true
 raptun-fec = { path = "../raptun-fec" }
 raptun-proto = { path = "../raptun-proto" }
+tempfile = "3"

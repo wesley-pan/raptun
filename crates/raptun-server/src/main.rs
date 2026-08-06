@@ -44,9 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the server's TLS identity.
     let identity = if args.self_signed {
-        let id = ServerIdentity::generate_self_signed("raptun")?;
-        tracing::info!(fingerprint = %id.fingerprint_hex, "generated self-signed certificate");
-        id
+        ServerIdentity::load_or_generate_self_signed(&args.identity_dir, "raptun")?
     } else {
         let cert_path = args
             .cert

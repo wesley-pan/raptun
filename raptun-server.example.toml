@@ -15,11 +15,14 @@ psk         = "env:RAPTUN_PSK"
 client_auth = "psk"                        # none | psk | mtls
 
 # TLS identity. Either point at a PEM cert+key (production), or set
-# self_signed = true to generate one at startup and print its fingerprint for
-# clients to pin (testing). cert/key and self_signed are mutually exclusive.
+# self_signed = true and identity_dir to generate and persist a self-signed
+# cert/key on first start. The fingerprint is stable across restarts until you
+# manually delete both files in identity_dir. cert/key and self_signed are
+# mutually exclusive.
 cert        = "/etc/raptun/server.pem"
 key         = "/etc/raptun/server-key.pem"
-# self_signed = true
+# self_signed  = true
+# identity_dir = "/etc/raptun/identity"
 
 max_conns   = 4096                         # max concurrent client connections
 # metrics   = "127.0.0.1:9100"             # Prometheus endpoint

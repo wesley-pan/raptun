@@ -17,12 +17,14 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
 
-# Harden the process: no new privileges, read-only filesystem except /etc/raptun.
+# Harden the process: no new privileges, read-only filesystem except the
+# identity directory where the self-signed cert/key are persisted.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
+ReadWritePaths=/etc/raptun/identity
 
 # Allow binding low ports if listen is < 1024 (remove if using port >= 1024).
 AmbientCapabilities=CAP_NET_BIND_SERVICE

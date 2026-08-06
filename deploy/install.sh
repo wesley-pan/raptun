@@ -66,6 +66,11 @@ install -o root -g raptun -m 640 \
     "$SCRIPT_DIR/raptun-server.toml" /etc/raptun/raptun-server.toml
 echo "installed /etc/raptun/raptun-server.toml"
 
+# Self-signed identity directory (writable by the service user).
+# The server persists cert.pem + key.pem here on first start and reuses them.
+install -d -o raptun -g raptun -m 700 /etc/raptun/identity
+echo "created /etc/raptun/identity"
+
 # Secrets env file: only create if it doesn't already exist to avoid clobbering
 # a live PSK on re-install.
 if [[ ! -f /etc/raptun/env ]]; then

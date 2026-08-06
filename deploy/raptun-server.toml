@@ -11,12 +11,15 @@ target = "127.0.0.1:8080"      # forward tunnelled TCP here
 psk         = "env:RAPTUN_PSK"
 client_auth = "psk"             # none | psk | mtls
 
-# TLS identity: self-signed certificate generated at each startup.
-# The server prints its fingerprint on boot; clients pin it via --fingerprint.
-# To use a CA-issued cert instead, replace these two lines with:
+# TLS identity: persisted self-signed certificate. The server generates cert.pem
+# and key.pem in identity_dir on first start and reuses them on every restart,
+# so the fingerprint stays stable. To rotate manually, stop the service, remove
+# both files in identity_dir, and restart. To use a CA-issued cert instead,
+# replace these two lines with:
 #   cert = "/etc/raptun/server.pem"
 #   key  = "/etc/raptun/server-key.pem"
-self_signed = true
+self_signed  = true
+identity_dir = "/etc/raptun/identity"
 
 max_conns = 4096
 log_level = "info"              # error | warn | info | debug | trace

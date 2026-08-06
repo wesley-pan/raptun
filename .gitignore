@@ -10,3 +10,6 @@
 
 # Stress-test run artifacts
 /stress/results/
+
+# Local self-signed identity directory (raptun-server --identity-dir default)
+.raptun/
