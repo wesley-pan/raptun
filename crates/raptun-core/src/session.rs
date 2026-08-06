@@ -231,13 +231,40 @@ fn clamp_fec(requested: &FecParams, config: &RuntimeConfig) -> FecParams {
     let symbol_size = config.fec.symbol_size.min(SAFE_MAX_SYMBOL_SIZE);
     // Clamp block_size too: a client-requested u16 = 65535 forces the sender
     // to allocate ~78 MB per block and the per-tunnel retention cap stops
-    // applying. Capped silently to MAX_BLOCK_SIZE (the HelloAck echoes the
+    // applying. Capped to MAX_BLOCK_SIZE (the HelloAck echoes the
     // clamped value so both ends agree).
     let block_size = requested.block_size.min(MAX_BLOCK_SIZE);
+    let repair_ppm = requested.repair_ppm.min(max_ppm);
+
+    if requested.symbol_size != symbol_size {
+        tracing::warn!(
+            requested = requested.symbol_size,
+            effective = symbol_size,
+            ceiling = SAFE_MAX_SYMBOL_SIZE,
+            "clamp_fec: client symbol_size adjusted by server"
+        );
+    }
+    if requested.block_size != block_size {
+        tracing::warn!(
+            requested = requested.block_size,
+            effective = block_size,
+            ceiling = MAX_BLOCK_SIZE,
+            "clamp_fec: client block_size clamped"
+        );
+    }
+    if requested.repair_ppm != repair_ppm {
+        tracing::warn!(
+            requested = requested.repair_ppm,
+            effective = repair_ppm,
+            ceiling = max_ppm,
+            "clamp_fec: client repair_ppm clamped"
+        );
+    }
+
     FecParams {
         symbol_size,
         block_size,
-        repair_ppm: requested.repair_ppm.min(max_ppm),
+        repair_ppm,
     }
 }
 

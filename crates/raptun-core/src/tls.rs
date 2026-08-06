@@ -108,7 +108,12 @@ pub enum ServerTrust {
 }
 
 /// Build a `quinn::ClientConfig` implementing [`ServerTrust`].
-pub fn client_config(trust: &ServerTrust) -> Result<quinn::ClientConfig> {
+///
+/// When `allow_0rtt` is `true`, the underlying rustls client config enables
+/// TLS 1.3 early data (0-RTT), allowing the client to send application data
+/// before the handshake completes on subsequent connections (when the server
+/// has issued a session ticket).
+pub fn client_config(trust: &ServerTrust, allow_0rtt: bool) -> Result<quinn::ClientConfig> {
     ensure_crypto_provider();
 
     let verifier: Arc<dyn ServerCertVerifier> = match trust {
@@ -121,6 +126,7 @@ pub fn client_config(trust: &ServerTrust) -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.enable_early_data = allow_0rtt;
 
     let quic = QuicClientConfig::try_from(crypto)
         .map_err(|e| CoreError::Tls(format!("quic client config: {e}")))?;
@@ -354,8 +360,9 @@ mod tests {
     #[test]
     fn client_config_builds_for_each_trust_mode() {
         let id = ServerIdentity::generate_self_signed("raptun.test").unwrap();
-        assert!(client_config(&ServerTrust::Fingerprint(id.fingerprint_hex.clone())).is_ok());
-        assert!(client_config(&ServerTrust::Insecure).is_ok());
+        assert!(client_config(&ServerTrust::Fingerprint(id.fingerprint_hex.clone()), false).is_ok());
+        assert!(client_config(&ServerTrust::Insecure, false).is_ok());
+        assert!(client_config(&ServerTrust::Insecure, true).is_ok());
         assert!(server_config(&id).is_ok());
     }
 }

@@ -920,6 +920,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "sha2",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

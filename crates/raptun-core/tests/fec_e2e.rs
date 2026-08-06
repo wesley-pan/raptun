@@ -92,7 +92,7 @@ async fn fec_tunnel_end_to_end() {
     let server_cfg = fec_config();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&server_cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &server_cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep); // free the port; run_server rebinds it
@@ -224,7 +224,7 @@ async fn client_reconnects_after_server_restart() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_addr = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport)
             .unwrap();
         ep.local_addr().unwrap()
     };
@@ -335,7 +335,7 @@ async fn fec_recovers_under_datagram_loss() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -426,7 +426,7 @@ async fn reliable_retransmit_completes_under_unrecoverable_loss() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -543,7 +543,7 @@ async fn client_emits_periodic_heartbeat() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_addr = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport)
             .unwrap();
         ep.local_addr().unwrap()
     };
@@ -687,7 +687,7 @@ async fn run_downstream_first_scenario() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_addr = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport)
+        let ep = raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport)
             .unwrap();
         ep.local_addr().unwrap()
     };
@@ -770,7 +770,7 @@ async fn many_concurrent_tunnels_do_not_stall() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -882,7 +882,7 @@ async fn shared_repair_budget_is_per_connection() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -977,7 +977,7 @@ async fn large_payload_survives_send_buffer_pressure() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -1081,7 +1081,7 @@ async fn unreachable_target_closes_client_connection() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -1148,7 +1148,7 @@ async fn credit_suppressed_still_completes_via_probe() {
     let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);

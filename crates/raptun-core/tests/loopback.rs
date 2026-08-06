@@ -28,7 +28,7 @@ async fn spawn_server(cfg: &RuntimeConfig) -> (quinn::Endpoint, SocketAddr, Stri
     let fingerprint = identity.fingerprint_hex.clone();
     let transport = build_transport(&cfg.transport).unwrap();
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let endpoint = build_server_endpoint(bind, &identity, transport).unwrap();
+    let endpoint = build_server_endpoint(bind, &identity, transport, &cfg.transport).unwrap();
     let addr = endpoint.local_addr().unwrap();
     (endpoint, addr, fingerprint)
 }
@@ -63,7 +63,7 @@ async fn handshake_and_bidirectional_tunnel() {
     // --- Client: connect, handshake, open a tunnel stream, send + verify echo.
     let transport = build_transport(&cfg.transport).unwrap();
     let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport).unwrap();
+        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &cfg.transport).unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()
@@ -106,7 +106,7 @@ async fn wrong_psk_is_rejected() {
     let client_cfg = config(Some("wrong-battery"));
     let transport = build_transport(&client_cfg.transport).unwrap();
     let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport).unwrap();
+        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &client_cfg.transport).unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()
@@ -139,7 +139,7 @@ async fn unreliable_datagram_symbol_round_trip() {
 
     let transport = build_transport(&cfg.transport).unwrap();
     let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport).unwrap();
+        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &cfg.transport).unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()

@@ -93,6 +93,8 @@ pub fn build_transport(cfg: &TransportConfig) -> Result<Arc<QuinnTransport>> {
     t.time_threshold(cfg.reorder_time_threshold);
     t.persistent_congestion_threshold(cfg.persistent_congestion_threshold);
     t.min_mtu(cfg.min_mtu);
+    t.initial_mtu(cfg.mtu);
+    t.pad_to_mtu(true);
     if let Some(rtt) = cfg.initial_rtt {
         t.initial_rtt(rtt);
     }
@@ -106,33 +108,108 @@ fn to_varint(v: u64) -> Result<VarInt> {
     VarInt::from_u64(v).map_err(|_| CoreError::Endpoint(format!("value {v} exceeds VarInt range")))
 }
 
+/// Set `SO_RCVBUF` and `SO_SNDBUF` on a UDP socket via socket2. The OS may
+/// silently cap the requested value to a system maximum; we log at debug level
+/// if the resulting buffer differs from the request so operators can diagnose
+/// a too-low `net.core.rmem_max` / `wmem_max` without the endpoint failing.
+fn apply_socket_buffers(socket: &socket2::Socket, requested: u32) {
+    let req = requested as usize;
+    if let Err(e) = socket.set_recv_buffer_size(req) {
+        tracing::warn!(error = %e, requested, "failed to set SO_RCVBUF");
+    }
+    if let Err(e) = socket.set_send_buffer_size(req) {
+        tracing::warn!(error = %e, requested, "failed to set SO_SNDBUF");
+    }
+    match (socket.recv_buffer_size(), socket.send_buffer_size()) {
+        (Ok(rcv), Ok(snd)) if rcv < req || snd < req => {
+            tracing::debug!(
+                requested,
+                actual_rcv = rcv,
+                actual_snd = snd,
+                "socket buffer smaller than requested (check sysctl rmem_max/wmem_max)"
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Build a client-side endpoint bound to an ephemeral local UDP port, with its
 /// default client config set from the given [`ServerTrust`] and transport.
+///
+/// The UDP socket's send/receive buffers are sized from `cfg.socket_buffer`
+/// (previously a dead config field — now applied via `SO_RCVBUF`/`SO_SNDBUF`).
+/// 0-RTT is enabled on the TLS client config when `cfg.allow_0rtt` is set.
 pub fn build_client_endpoint(
     trust: &ServerTrust,
     transport: Arc<QuinnTransport>,
+    cfg: &TransportConfig,
 ) -> Result<Endpoint> {
-    // Bind to an unspecified IPv4 address / ephemeral port for outbound use.
     let local: SocketAddr = "0.0.0.0:0".parse().expect("static addr literal is valid");
-    let mut endpoint = Endpoint::client(local)?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(local),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| CoreError::Endpoint(format!("create socket: {e}")))?;
+    socket
+        .bind(&local.into())
+        .map_err(|e| CoreError::Endpoint(format!("bind UDP: {e}")))?;
+    apply_socket_buffers(&socket, cfg.socket_buffer);
 
-    let mut client_cfg = tls::client_config(trust)?;
+    let mut client_cfg = tls::client_config(trust, cfg.allow_0rtt)?;
     client_cfg.transport_config(transport);
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    let runtime = Arc::new(quinn::TokioRuntime);
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        std_socket,
+        runtime,
+    )
+    .map_err(|e| CoreError::Endpoint(format!("client endpoint: {e}")))?;
     endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
 }
 
 /// Build a server-side endpoint listening on `bind` with the given identity and
 /// transport parameters.
+///
+/// The UDP socket's send/receive buffers are sized from `cfg.socket_buffer`.
+/// Connection migration is controlled by `cfg.allow_migration`.
 pub fn build_server_endpoint(
     bind: SocketAddr,
     identity: &ServerIdentity,
     transport: Arc<QuinnTransport>,
+    cfg: &TransportConfig,
 ) -> Result<Endpoint> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| CoreError::Endpoint(format!("create socket: {e}")))?;
+    // Intentionally no SO_REUSEADDR: Quinn's Endpoint::server() doesn't set it
+    // either, and enabling it causes the kernel to load-balance incoming packets
+    // between the old and new socket during server restarts, breaking reconnection.
+    socket
+        .bind(&bind.into())
+        .map_err(|e| CoreError::Endpoint(format!("bind UDP: {e}")))?;
+    apply_socket_buffers(&socket, cfg.socket_buffer);
+
     let mut server_cfg: ServerConfig = tls::server_config(identity)?;
     server_cfg.transport_config(transport);
-    let endpoint = Endpoint::server(server_cfg, bind)?;
-    Ok(endpoint)
+    server_cfg.migration(cfg.allow_migration);
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    let runtime = Arc::new(quinn::TokioRuntime);
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg),
+        std_socket,
+        runtime,
+    )
+    .map_err(|e| CoreError::Endpoint(format!("server endpoint: {e}")))
 }
 
 /// Sanity bound: the largest symbol payload that fits in one datagram given the
@@ -211,18 +288,19 @@ mod tests {
 
     #[tokio::test]
     async fn client_endpoint_builds() {
-        let transport = build_transport(&TransportConfig::default()).unwrap();
-        // Binding an ephemeral UDP socket should succeed in the test env.
-        let ep = build_client_endpoint(&ServerTrust::Insecure, transport);
+        let cfg = TransportConfig::default();
+        let transport = build_transport(&cfg).unwrap();
+        let ep = build_client_endpoint(&ServerTrust::Insecure, transport, &cfg);
         assert!(ep.is_ok(), "client endpoint: {:?}", ep.err());
     }
 
     #[tokio::test]
     async fn server_endpoint_builds() {
         let id = ServerIdentity::generate_self_signed("raptun.test").unwrap();
-        let transport = build_transport(&TransportConfig::default()).unwrap();
+        let cfg = TransportConfig::default();
+        let transport = build_transport(&cfg).unwrap();
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let ep = build_server_endpoint(bind, &id, transport);
+        let ep = build_server_endpoint(bind, &id, transport, &cfg);
         assert!(ep.is_ok(), "server endpoint: {:?}", ep.err());
     }
 }

@@ -57,7 +57,7 @@ pub async fn run_client(
     }
 
     let transport = build_transport(&config.transport)?;
-    let endpoint = build_client_endpoint(&trust, transport)?;
+    let endpoint = build_client_endpoint(&trust, transport, &config.transport)?;
 
     // Bind the local listener once so the local port is stable across QUIC
     // reconnects. Accepted connections are held until a live server connection
@@ -452,7 +452,7 @@ pub async fn run_server(
     tracing::info!(fingerprint = %identity.fingerprint_hex, "pin this fingerprint on clients");
 
     let transport = build_transport(&config.transport)?;
-    let endpoint = build_server_endpoint(bind, &identity, transport)?;
+    let endpoint = build_server_endpoint(bind, &identity, transport, &config.transport)?;
     tracing::info!(%bind, %target, "raptun server listening");
 
     while let Some(incoming) = endpoint.accept().await {
@@ -935,11 +935,15 @@ async fn run_fec_tunnel(
     // can recover entirely-lost blocks even when no later block follows.
     let (hw_tx, mut hw_rx) = mpsc::unbounded_channel::<u64>();
     // Reliable-retransmit requests routed to the upstream task (which owns the
-    // sender and its retained block payloads).
-    let (rel_req_tx, mut rel_req_rx) = mpsc::unbounded_channel::<u64>();
+    // sender and its retained block payloads). Bounded: if the upstream task
+    // is slow to serve requests, the channel fills and the reader drops new
+    // ones — the tick mechanism will re-request them next cycle.
+    let (rel_req_tx, mut rel_req_rx) = mpsc::channel::<u64>(32);
     // Reliable-retransmit data routed to the downstream task (which owns the
-    // receiver and delivers in order).
-    let (rel_data_tx, mut rel_data_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+    // receiver and delivers in order). Bounded: each message carries a full
+    // block payload (up to ~20 KiB), so 4 slots = ~80 KiB max queued. If full,
+    // the reader drops the message and the tick re-requests it.
+    let (rel_data_tx, mut rel_data_rx) = mpsc::channel::<(u64, Vec<u8>)>(4);
     // Flow-control credit routed from the signal reader to the upstream task:
     // the peer's cumulative delivered-block high-water. `up` gates production so
     // in-flight blocks stay bounded (see `CREDIT_WINDOW_BLOCKS`).
@@ -974,15 +978,28 @@ async fn run_fec_tunnel(
         while let Some(sig) = sig_rx.recv().await {
             let bytes = sig.encode();
             if let Err(e) = sig_send.write_all(&bytes).await {
-                // Surface the cause: previously this was a bare `is_err() { break }`
-                // and the *only* signal in the log was the peer reset the
-                // reader observed later. Operators had no way to tell whether
-                // the channel failed because of back-pressure, a closed
-                // connection, or a framing error on our side (H5).
-                tracing::warn!(
-                    error = %e,
-                    "signaling writer failed; closing the channel"
-                );
+                // Classify the write error: Stopped(0) and graceful connection
+                // close are the normal teardown path (peer finished reading the
+                // signaling stream), not a failure. Log those at debug to avoid
+                // flooding the log with one warn per clean tunnel disconnect.
+                // All other variants are genuine failures and stay at warn.
+                match &e {
+                    quinn::WriteError::Stopped(code) if code.into_inner() == 0 => {
+                        tracing::debug!("signaling writer: peer finished (Stopped(0))");
+                    }
+                    quinn::WriteError::ConnectionLost(
+                        quinn::ConnectionError::ApplicationClosed(_)
+                        | quinn::ConnectionError::LocallyClosed,
+                    ) => {
+                        tracing::debug!(reason = %e, "signaling writer: connection closing");
+                    }
+                    _ => {
+                        tracing::warn!(
+                            error = %e,
+                            "signaling writer failed; closing the channel"
+                        );
+                    }
+                }
                 break;
             }
         }
@@ -1027,10 +1044,14 @@ async fn run_fec_tunnel(
                                 let _ = nack_tx.send((block, need));
                             }
                             TunnelSignal::ReliableRequest { block } => {
-                                let _ = rel_req_tx.send(block);
+                                if let Err(e) = rel_req_tx.try_send(block) {
+                                    tracing::debug!(block, error = %e, "rel_req channel full; tick will retry");
+                                }
                             }
                             TunnelSignal::ReliableData { block, bytes } => {
-                                let _ = rel_data_tx.send((block, bytes));
+                                if let Err(e) = rel_data_tx.try_send((block, bytes)) {
+                                    tracing::debug!(block, error = %e, "rel_data channel full; tick will retry");
+                                }
                             }
                             TunnelSignal::Credit { delivered } => {
                                 let _ = credit_tx.send(delivered);
@@ -1154,6 +1175,12 @@ async fn run_fec_tunnel(
                         for dg in sender.encode_one_block(chunk, repair) {
                             send_datagram_paced(&up_conn, dg).await;
                         }
+                        // Yield after each block's burst so other tunnels on the
+                        // same QUIC connection can interleave their datagrams.
+                        // Without this, a high-throughput tunnel's ~24-datagram
+                        // burst (K=16 + 8 repair) fills the send buffer and
+                        // starves latency-sensitive tunnels.
+                        tokio::task::yield_now().await;
                         total_blocks += 1;
                         if let Some(s) = &up_stats {
                             s.record_block(repair);
