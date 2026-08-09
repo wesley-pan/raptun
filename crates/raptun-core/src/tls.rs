@@ -161,8 +161,9 @@ fn write_identity_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        opts.mode(0o600);
+        opts.mode(mode);
     }
+    let _ = mode;
     let mut file = opts.open(&tmp)?;
     file.write_all(contents)?;
     file.sync_all()?;

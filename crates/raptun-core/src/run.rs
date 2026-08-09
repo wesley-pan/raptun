@@ -371,7 +371,7 @@ fn spawn_client_heartbeat(
                     // count are always meaningful.
                     let sample = crate::session::read_telemetry(
                         &conn,
-                        &mut *conn_loss_tracker.lock().expect("loss tracker poisoned"),
+                        &mut conn_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
                     if first_tick {
                         tracing::info!(
@@ -1448,7 +1448,7 @@ async fn run_fec_tunnel(
                     // which is the same default the controller always had.
                     let sample = crate::session::read_telemetry(
                         &down_conn,
-                        &mut *down_loss_tracker.lock().expect("loss tracker poisoned"),
+                        &mut down_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
                     let link = classifier.to_link_state(sample);
                     budget.refresh_ceiling(link.cwnd_bytes());
