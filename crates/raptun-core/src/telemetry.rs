@@ -172,6 +172,13 @@ impl RegimeClassifier {
     /// Rules (see design doc §"random vs congestion"):
     /// * cwnd fell meaningfully since last tick ⇒ [`LossRegime::Congestion`]
     ///   (the transport is reacting to a full link; do **not** add FEC).
+    /// * heavy smoothed loss (>10%) while the cwnd has stopped growing ⇒
+    ///   [`LossRegime::Congestion`]. This is the local-buffer-overflow
+    ///   tail-drop signature: BBR keeps the cwnd flat-or-high because the
+    ///   drops happen in a local/middlebox queue it cannot see, so the
+    ///   cwnd-cut rule above never fires — yet piling FEC repair onto the
+    ///   overloaded queue only deepens the loss (the flapping feedback loop,
+    ///   docs/raptun-congestion-optimization-plan.md §3.3).
     /// * negligible loss ⇒ [`LossRegime::Quiescent`].
     /// * otherwise (loss present, cwnd stable/growing) ⇒ [`LossRegime::Random`]
     ///   (FEC helps).
@@ -182,6 +189,9 @@ impl RegimeClassifier {
         let regime = match self.prev_cwnd {
             // A >12.5% drop in cwnd is treated as a congestion reaction.
             Some(prev) if cwnd_bytes < prev - prev / 8 => LossRegime::Congestion,
+            // Heavy loss with a non-growing cwnd: tail-drop congestion that
+            // the transport's own loss detector failed to classify.
+            Some(prev) if self.smoothed_loss > 0.10 && cwnd_bytes <= prev => LossRegime::Congestion,
             _ if self.smoothed_loss < 0.005 => LossRegime::Quiescent,
             _ => LossRegime::Random,
         };
@@ -242,6 +252,41 @@ mod tests {
         let mut c = RegimeClassifier::new();
         c.classify(100_000, 0.0);
         assert_eq!(c.classify(100_000, 0.0), LossRegime::Quiescent);
+    }
+
+    #[test]
+    fn high_loss_with_flat_cwnd_is_congestion() {
+        // The local-buffer-overflow tail-drop scenario: BBR never cuts the
+        // cwnd (loss happens in the local queue, invisible to it), yet the
+        // link is drowning. High smoothed loss + a cwnd that has stopped
+        // growing must classify as Congestion so FEC backs off instead of
+        // amplifying the overload (the flapping root cause,
+        // docs/raptun-congestion-optimization-plan.md §3.3).
+        let mut c = RegimeClassifier::new();
+        // Feed several samples so the EWMA (0.7/0.3) crosses the 10% gate:
+        // 0.09 → 0.153 → 0.197 …
+        c.classify(100_000, 0.30);
+        c.classify(100_000, 0.30);
+        assert_eq!(
+            c.classify(100_000, 0.30),
+            LossRegime::Congestion,
+            "sustained 30% loss with a flat cwnd is congestion, not random loss"
+        );
+    }
+
+    #[test]
+    fn moderate_loss_with_growing_cwnd_stays_random() {
+        // Below the 10% gate, or with a growing cwnd, the new rule must not
+        // fire: genuine random loss on a lossy-but-uncongested link still
+        // wants FEC.
+        let mut c = RegimeClassifier::new();
+        c.classify(100_000, 0.08);
+        c.classify(110_000, 0.08);
+        assert_eq!(
+            c.classify(120_000, 0.08),
+            LossRegime::Random,
+            "8% loss with a growing cwnd must stay Random (FEC helps here)"
+        );
     }
 
     #[test]

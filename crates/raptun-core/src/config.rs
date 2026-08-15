@@ -45,6 +45,8 @@ pub struct FecConfig {
     /// Source block size K, or `None` for auto (derive from RTT).
     pub block_size: Option<u16>,
     /// Fraction of cwnd that in-flight repair may occupy (the budget brake).
+    /// Clamped to [0.05, 0.40]: above 0.40 repair traffic competes with data
+    /// hard enough to *cause* the congestion it is meant to repair.
     pub repair_cwnd_fraction: f64,
 }
 
@@ -68,7 +70,7 @@ impl Default for FecConfig {
             strategy: StrategyConfig::default(),
             symbol_size: 1200,
             block_size: None,
-            repair_cwnd_fraction: 0.40,
+            repair_cwnd_fraction: 0.20,
         }
     }
 }
@@ -101,7 +103,17 @@ pub struct TransportConfig {
     /// until an old stream closes — the "new streams stall until a timeout"
     /// symptom. Raptun raises it well above that.
     pub max_concurrent_streams: u32,
+    /// UDP socket send/receive buffer (`SO_SNDBUF`/`SO_RCVBUF`). Kept small
+    /// (RTT-scale, not seconds-scale): an oversized OS queue hides the real
+    /// link from BBR — packets "send" into the buffer, cwnd stays inflated,
+    /// then the queue tail-drops in bursts. If throughput drops on a long fat
+    /// pipe, step up gradually (e.g. to 1 MiB); do not return to 4 MiB.
     pub socket_buffer: u32,
+    /// Quinn datagram *send*-buffer size. Same bufferbloat trade-off as
+    /// `socket_buffer`: too large and a bulk flow queues seconds of symbols
+    /// locally before loss is visible; too small and normal bursts repeatedly
+    /// park the send loop. 2 MiB keeps the local queue near RTT-scale.
+    pub datagram_send_buffer: usize,
     pub keepalive: Option<Duration>,
     pub idle_timeout: Duration,
     /// How long the server waits for a TCP connection to its forwarding target
@@ -156,9 +168,10 @@ impl Default for TransportConfig {
             stream_recv_window: 2 * 1024 * 1024,
             conn_recv_window: 16 * 1024 * 1024,
             max_concurrent_streams: 1024,
-            socket_buffer: 4 * 1024 * 1024,
-            keepalive: Some(Duration::from_secs(10)),
-            idle_timeout: Duration::from_secs(30),
+            socket_buffer: 512 * 1024,
+            datagram_send_buffer: 2 * 1024 * 1024,
+            keepalive: Some(Duration::from_secs(3)),
+            idle_timeout: Duration::from_secs(10),
             target_connect_timeout: Duration::from_secs(10),
             allow_migration: true,
             allow_0rtt: true,

@@ -62,7 +62,13 @@ async fn server_clamps_malicious_block_size() {
     // Pre-bind to learn the port, then drop and have a server task rebind.
     let server_ep = {
         let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
-        raptun_core::endpoint::build_server_endpoint(server_bind, &identity, transport, &cfg.transport).unwrap()
+        raptun_core::endpoint::build_server_endpoint(
+            server_bind,
+            &identity,
+            transport,
+            &cfg.transport,
+        )
+        .unwrap()
     };
     let server_addr = server_ep.local_addr().unwrap();
     drop(server_ep);
@@ -73,8 +79,13 @@ async fn server_clamps_malicious_block_size() {
     let srv_cfg = cfg.clone();
     let _server = tokio::spawn(async move {
         let transport = raptun_core::endpoint::build_transport(&srv_cfg.transport).unwrap();
-        let ep = raptun_core::endpoint::build_server_endpoint(server_addr, &identity, transport, &srv_cfg.transport)
-            .unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(
+            server_addr,
+            &identity,
+            transport,
+            &srv_cfg.transport,
+        )
+        .unwrap();
         if let Some(incoming) = ep.accept().await {
             if let Ok(conn) = incoming.await {
                 let _ = raptun_core::session::handshake_server(&conn, &srv_cfg).await;
@@ -90,7 +101,8 @@ async fn server_clamps_malicious_block_size() {
     // Connect a malicious client and send Hello { block_size: u16::MAX }.
     let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
     let trust = ServerTrust::Fingerprint(fingerprint);
-    let client_ep = raptun_core::endpoint::build_client_endpoint(&trust, transport, &cfg.transport).unwrap();
+    let client_ep =
+        raptun_core::endpoint::build_client_endpoint(&trust, transport, &cfg.transport).unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun")
         .unwrap()

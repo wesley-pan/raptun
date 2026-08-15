@@ -35,6 +35,36 @@ pub enum ListenMode {
     Socks5,
 }
 
+/// First reconnect delay after a connection failure. Short, because the user
+/// is typically waiting behind a stalled tunnel; jitter (below) keeps a fleet
+/// of clients from re-dialing in lockstep.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// Cap on the exponential reconnect backoff. Kept low (5 s, was 30 s): during
+/// congestion-induced flapping the link itself recovers in seconds once the
+/// queues drain, so a 30 s wait only prolongs the outage.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Apply ±25% jitter to a backoff delay.
+///
+/// Uses the monotonic clock's sub-microsecond bits as a cheap entropy source
+/// rather than pulling in a `rand` dependency: reconnect timing needs
+/// decorrelation, not cryptographic quality.
+fn jitter(d: Duration) -> Duration {
+    let nanos = std::time::Instant::now().elapsed().as_nanos() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.subsec_nanos() as u64)
+            .unwrap_or(0);
+    // Map the low bits onto [-25%, +25%].
+    let base = d.as_millis() as u64;
+    let span = base / 2; // total jitter window = 50% of base
+    if span == 0 {
+        return d;
+    }
+    let offset = nanos % (span + 1); // [0, span]
+    Duration::from_millis(base - span / 2 + offset)
+}
+
 /// Run the client: listen locally, and for each accepted TCP connection open a
 /// QUIC bi-stream to the server and pump bytes both ways.
 ///
@@ -69,18 +99,22 @@ pub async fn run_client(
 
     // Supervision loop: (re)establish the QUIC connection and serve tunnels over
     // it until it drops, then reconnect with capped exponential backoff.
-    let mut backoff = Duration::from_millis(500);
-    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    //
+    // Fast cadence (200 ms → 5 s): after a flapping-induced teardown the user is
+    // actively waiting, so recovery must be prompt; the ±25% jitter prevents
+    // many clients (or many local tunnels) from re-dialing in lockstep.
+    let mut backoff = INITIAL_BACKOFF;
     loop {
         tracing::info!(%server_addr, %sni, "connecting to raptun server");
         let conn = match connect_and_handshake(&endpoint, server_addr, sni, &config).await {
             Ok(conn) => {
-                backoff = Duration::from_millis(500); // reset after a good connection
+                backoff = INITIAL_BACKOFF; // reset after a good connection
                 conn
             }
             Err(e) => {
-                tracing::warn!(error = %e, retry_in = ?backoff, "connect/handshake failed; retrying");
-                tokio::time::sleep(backoff).await;
+                let delay = jitter(backoff);
+                tracing::warn!(error = %e, retry_in = ?delay, "connect/handshake failed; retrying");
+                tokio::time::sleep(delay).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }

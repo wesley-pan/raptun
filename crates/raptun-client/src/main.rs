@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     args.merge_file(&matches)?;
     init_tracing(&args.log_level, args.quiet);
 
-    let config = args.to_runtime_config();
+    let config = args.to_runtime_config()?;
 
     // Resolve listen + server addresses.
     let local_addr = args

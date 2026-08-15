@@ -154,7 +154,10 @@ impl ServerIdentity {
 
 /// Atomically write an identity file and set restrictive permissions.
 fn write_identity_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    let tmp_name = format!("{}.tmp", path.file_name().unwrap_or_default().to_string_lossy());
+    let tmp_name = format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
     let tmp = path.with_file_name(tmp_name);
 
     let mut opts = fs::OpenOptions::new();
@@ -448,7 +451,9 @@ mod tests {
     #[test]
     fn client_config_builds_for_each_trust_mode() {
         let id = ServerIdentity::generate_self_signed("raptun.test").unwrap();
-        assert!(client_config(&ServerTrust::Fingerprint(id.fingerprint_hex.clone()), false).is_ok());
+        assert!(
+            client_config(&ServerTrust::Fingerprint(id.fingerprint_hex.clone()), false).is_ok()
+        );
         assert!(client_config(&ServerTrust::Insecure, false).is_ok());
         assert!(client_config(&ServerTrust::Insecure, true).is_ok());
         assert!(server_config(&id).is_ok());
