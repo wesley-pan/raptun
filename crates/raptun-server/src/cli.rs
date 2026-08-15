@@ -622,4 +622,62 @@ mod tests {
         let cli = merged(&["raptun-server"], "identity_dir = \"/var/lib/raptun\"\n");
         assert_eq!(cli.identity_dir, "/var/lib/raptun");
     }
+
+    #[test]
+    fn new_phase1_flags_merge_from_file() {
+        let cli = merged(
+            &["raptun-server"],
+            "[fec]\nrepair_cwnd_frac = 0.10\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(cli.repair_cwnd_frac, 0.10);
+        assert_eq!(cli.dgram_sndbuf, 1048576);
+        // CLI beats file:
+        let cli = merged(
+            &[
+                "raptun-server",
+                "--repair-cwnd-frac",
+                "0.35",
+                "--dgram-sndbuf",
+                "524288",
+            ],
+            "[fec]\nrepair_cwnd_frac = 0.10\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(cli.repair_cwnd_frac, 0.35);
+        assert_eq!(cli.dgram_sndbuf, 524288);
+    }
+
+    #[test]
+    fn phase1_defaults_are_tuned() {
+        let cli = merged(&["raptun-server"], "");
+        assert_eq!(cli.sockbuf, 512 * 1024);
+        assert_eq!(cli.dgram_sndbuf, 2 * 1024 * 1024);
+        assert_eq!(cli.repair_cwnd_frac, 0.20);
+        assert_eq!(cli.keepalive, 3);
+        assert_eq!(cli.idle_timeout, 10);
+        let rc = cli.to_runtime_config().expect("valid defaults");
+        assert_eq!(rc.transport.socket_buffer, 512 * 1024);
+        assert_eq!(rc.transport.datagram_send_buffer, 2 * 1024 * 1024);
+        assert!((rc.fec.repair_cwnd_fraction - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keepalive_must_be_less_than_idle_timeout() {
+        let cli = merged(
+            &["raptun-server", "--keepalive", "10", "--idle-timeout", "10"],
+            "",
+        );
+        assert!(cli.to_runtime_config().is_err());
+        let cli = merged(&["raptun-server", "--keepalive", "0"], "");
+        assert!(
+            cli.to_runtime_config().is_ok(),
+            "keepalive=0 (disabled) is exempt"
+        );
+    }
+
+    #[test]
+    fn repair_cwnd_frac_is_clamped() {
+        let cli = merged(&["raptun-server", "--repair-cwnd-frac", "0.9"], "");
+        let rc = cli.to_runtime_config().unwrap();
+        assert!((rc.fec.repair_cwnd_fraction - 0.40).abs() < 1e-9);
+    }
 }

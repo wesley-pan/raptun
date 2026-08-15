@@ -231,6 +231,19 @@ mod tests {
         let cfg = TransportConfig::default();
         assert!(build_transport(&cfg).is_ok());
         assert_eq!(max_symbol_payload(&cfg), Some(cfg.mtu));
+        // The bufferbloat-tuned default: 2 MiB, not the old 8 MiB constant.
+        assert_eq!(cfg.datagram_send_buffer, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn transport_applies_custom_datagram_send_buffer() {
+        // The send buffer is config-driven now (bufferbloat lever); Quinn has
+        // no getter, so this asserts acceptance of a non-default value.
+        let cfg = TransportConfig {
+            datagram_send_buffer: 256 * 1024,
+            ..TransportConfig::default()
+        };
+        assert!(build_transport(&cfg).is_ok());
     }
 
     #[test]

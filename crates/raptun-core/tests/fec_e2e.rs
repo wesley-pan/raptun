@@ -60,6 +60,17 @@ fn fec_config() -> RuntimeConfig {
             scheme: FecScheme::RaptorQ,
             symbol_size: 1200,
             block_size: Some(8),
+            // These e2e tests slam up to 250 tunnels through one loopback
+            // socket simultaneously, overflowing the UDP receive buffer and
+            // inflicting loss far beyond any production burst. The production
+            // default (0.20, bufferbloat-tuned for WAN links) pushes recovery
+            // onto the reliable-fallback path, whose throughput is a known
+            // Phase-3 bottleneck (shared signaling stream; see
+            // docs/raptun-congestion-optimization-plan.md §3.4), and the
+            // 250-tunnel test then misses its deadline. Pin the old 0.40:
+            // this suite verifies stream caps and data-path correctness, not
+            // repair-budget sizing.
+            repair_cwnd_fraction: 0.40,
             ..FecConfig::default()
         },
         transport: TransportConfig {
@@ -69,6 +80,10 @@ fn fec_config() -> RuntimeConfig {
             // is torn down before all tunnels complete.
             keepalive: Some(Duration::from_secs(5)),
             idle_timeout: Duration::from_secs(60),
+            // 250 tunnels on loopback produce a burst the production 512 KiB
+            // socket buffer cannot absorb — the kernel drops packets before
+            // Quinn drains them, stalling tunnels past the 20 s deadline.
+            socket_buffer: 4 * 1024 * 1024,
             ..TransportConfig::default()
         },
         psk: Some("fec-secret".into()),
@@ -215,10 +230,7 @@ async fn client_reconnects_after_server_restart() {
     }
 
     let _guard = E2E_LOCK.lock().await;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("raptun_core=debug")
-        .with_test_writer()
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let echo_addr = spawn_echo().await;
 
     // Reliable-stream config (FEC off) keeps the test focused on reconnect.

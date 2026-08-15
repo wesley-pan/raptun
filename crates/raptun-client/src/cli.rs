@@ -639,6 +639,112 @@ mod tests {
     }
 
     #[test]
+    fn new_phase1_flags_merge_from_file() {
+        let cli = merged(
+            &["raptun-client", "-r", "10.0.0.1:29900"],
+            "[fec]\nrepair_cwnd_frac = 0.15\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(
+            cli.repair_cwnd_frac, 0.15,
+            "file [fec].repair_cwnd_frac must apply"
+        );
+        assert_eq!(
+            cli.dgram_sndbuf, 1048576,
+            "file [transport].dgram_sndbuf must apply"
+        );
+        // CLI beats file:
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.30",
+                "--dgram-sndbuf",
+                "524288",
+            ],
+            "[fec]\nrepair_cwnd_frac = 0.15\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(cli.repair_cwnd_frac, 0.30);
+        assert_eq!(cli.dgram_sndbuf, 524288);
+    }
+
+    #[test]
+    fn phase1_defaults_are_tuned() {
+        let cli = merged(&["raptun-client", "-r", "10.0.0.1:29900"], "");
+        assert_eq!(cli.sockbuf, 512 * 1024, "sockbuf default must be 512 KiB");
+        assert_eq!(cli.dgram_sndbuf, 2 * 1024 * 1024);
+        assert_eq!(cli.repair_cwnd_frac, 0.20);
+        assert_eq!(cli.keepalive, 3);
+        assert_eq!(cli.idle_timeout, 10);
+        // Wiring into RuntimeConfig:
+        let rc = cli.to_runtime_config().expect("valid defaults");
+        assert_eq!(rc.transport.socket_buffer, 512 * 1024);
+        assert_eq!(rc.transport.datagram_send_buffer, 2 * 1024 * 1024);
+        assert!((rc.fec.repair_cwnd_fraction - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keepalive_must_be_less_than_idle_timeout() {
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--keepalive",
+                "10",
+                "--idle-timeout",
+                "10",
+            ],
+            "",
+        );
+        assert!(
+            cli.to_runtime_config().is_err(),
+            "keepalive >= idle_timeout must be rejected"
+        );
+        // keepalive = 0 (disabled) is exempt from the check.
+        let cli = merged(
+            &["raptun-client", "-r", "10.0.0.1:29900", "--keepalive", "0"],
+            "",
+        );
+        assert!(cli.to_runtime_config().is_ok());
+    }
+
+    #[test]
+    fn repair_cwnd_frac_is_clamped() {
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.9",
+            ],
+            "",
+        );
+        let rc = cli.to_runtime_config().unwrap();
+        assert!(
+            (rc.fec.repair_cwnd_fraction - 0.40).abs() < 1e-9,
+            "must clamp to 0.40"
+        );
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.01",
+            ],
+            "",
+        );
+        let rc = cli.to_runtime_config().unwrap();
+        assert!(
+            (rc.fec.repair_cwnd_fraction - 0.05).abs() < 1e-9,
+            "must clamp to 0.05"
+        );
+    }
+
+    #[test]
     fn env_prefixed_psk_resolves() {
         // SAFETY: single-threaded test; set then read one process env var.
         std::env::set_var("RAPTUN_TEST_PSK_X", "sekret");
