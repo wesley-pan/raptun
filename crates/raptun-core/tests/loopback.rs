@@ -62,8 +62,12 @@ async fn handshake_and_bidirectional_tunnel() {
 
     // --- Client: connect, handshake, open a tunnel stream, send + verify echo.
     let transport = build_transport(&cfg.transport).unwrap();
-    let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &cfg.transport).unwrap();
+    let client_ep = build_client_endpoint(
+        &ServerTrust::Fingerprint(fingerprint),
+        transport,
+        &cfg.transport,
+    )
+    .unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()
@@ -105,8 +109,12 @@ async fn wrong_psk_is_rejected() {
     // Client presents the wrong PSK.
     let client_cfg = config(Some("wrong-battery"));
     let transport = build_transport(&client_cfg.transport).unwrap();
-    let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &client_cfg.transport).unwrap();
+    let client_ep = build_client_endpoint(
+        &ServerTrust::Fingerprint(fingerprint),
+        transport,
+        &client_cfg.transport,
+    )
+    .unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()
@@ -138,8 +146,12 @@ async fn unreliable_datagram_symbol_round_trip() {
     });
 
     let transport = build_transport(&cfg.transport).unwrap();
-    let client_ep =
-        build_client_endpoint(&ServerTrust::Fingerprint(fingerprint), transport, &cfg.transport).unwrap();
+    let client_ep = build_client_endpoint(
+        &ServerTrust::Fingerprint(fingerprint),
+        transport,
+        &cfg.transport,
+    )
+    .unwrap();
     let conn = client_ep
         .connect(server_addr, "raptun.test")
         .unwrap()

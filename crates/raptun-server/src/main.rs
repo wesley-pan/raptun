@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // corrupting the display; otherwise tracing writes to stdout as before.
     init_tracing(&args.log_level, args.quiet, args.monitor, &args.monitor_log);
 
-    let config = args.to_runtime_config();
+    let config = args.to_runtime_config()?;
 
     let bind = args
         .listen

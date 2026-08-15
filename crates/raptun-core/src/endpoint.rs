@@ -19,14 +19,17 @@ use crate::{CoreError, Result};
 /// burst of symbols; a few MiB is plenty for the FEC path.
 const DATAGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 
-/// Datagram *send*-buffer size. Quinn's default is only 1 MiB, and its
-/// `send_datagram` silently evicts the oldest queued symbol once that fills —
-/// so a large burst strands early blocks and stalls the tunnel (see
-/// `live_size_sweep.sh`). The sender back-pressures on a full buffer rather
-/// than evicting (`send_datagram_paced` in `run.rs`), but a generous buffer,
-/// symmetric with the receive side, keeps normal bursts flowing without
-/// repeatedly parking the send loop.
-const DATAGRAM_SEND_BUFFER: usize = 8 * 1024 * 1024;
+// Datagram *send*-buffer size comes from `TransportConfig::datagram_send_buffer`
+// (default 2 MiB). Quinn's own default is only 1 MiB, and its `send_datagram`
+// silently evicts the oldest queued symbol once that fills — so a large burst
+// strands early blocks and stalls the tunnel (see `live_size_sweep.sh`). The
+// sender back-pressures on a full buffer rather than evicting
+// (`send_datagram_paced` in `run.rs`). The buffer must stay *small enough*
+// that a bulk flow cannot queue seconds of symbols locally: an oversized
+// buffer hides the real link from BBR (everything "sends" successfully into
+// the queue), cwnd stays inflated, and the queue eventually tail-drops whole
+// blocks in bursts — the bufferbloat → loss-spike → repair-storm flapping
+// cycle documented in `docs/raptun-congestion-optimization-plan.md`.
 
 /// Translate [`TransportConfig`] into a shared `quinn::TransportConfig`.
 ///
@@ -74,7 +77,7 @@ pub fn build_transport(cfg: &TransportConfig) -> Result<Arc<QuinnTransport>> {
     // FEC path is bypassed and business data rides reliable streams instead.
     if cfg.use_datagrams {
         t.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
-        t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+        t.datagram_send_buffer_size(cfg.datagram_send_buffer);
     } else {
         t.datagram_receive_buffer_size(None);
     }
@@ -161,13 +164,8 @@ pub fn build_client_endpoint(
 
     let std_socket: std::net::UdpSocket = socket.into();
     let runtime = Arc::new(quinn::TokioRuntime);
-    let mut endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        std_socket,
-        runtime,
-    )
-    .map_err(|e| CoreError::Endpoint(format!("client endpoint: {e}")))?;
+    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, std_socket, runtime)
+        .map_err(|e| CoreError::Endpoint(format!("client endpoint: {e}")))?;
     endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
 }
@@ -233,6 +231,19 @@ mod tests {
         let cfg = TransportConfig::default();
         assert!(build_transport(&cfg).is_ok());
         assert_eq!(max_symbol_payload(&cfg), Some(cfg.mtu));
+        // The bufferbloat-tuned default: 2 MiB, not the old 8 MiB constant.
+        assert_eq!(cfg.datagram_send_buffer, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn transport_applies_custom_datagram_send_buffer() {
+        // The send buffer is config-driven now (bufferbloat lever); Quinn has
+        // no getter, so this asserts acceptance of a non-default value.
+        let cfg = TransportConfig {
+            datagram_send_buffer: 256 * 1024,
+            ..TransportConfig::default()
+        };
+        assert!(build_transport(&cfg).is_ok());
     }
 
     #[test]

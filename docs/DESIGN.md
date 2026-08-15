@@ -386,6 +386,7 @@ FEC 不是免费午餐,且**并非总是有益**:
 |---|---|---|
 | cwnd 稳定 / 增长但仍在丢 | `Random` | 慢环上调 repair 至 `loss × safety_margin` |
 | cwnd 相对上一 tick 跌 > 12.5% | `Congestion` | 慢环下调至 `min`,快环熄火,绝不加码 |
+| 平滑丢包率 > 10% 且 cwnd 未增长 | `Congestion` | 同上——本地/中间队列尾丢时 BBR 不砍 cwnd,但高丢包+cwnd 停滞即是拥塞信号(防 repair 正反馈雪崩) |
 | 平滑丢包率 < 0.5% | `Quiescent` | 衰减至 `min`,保留最小冗余 |
 
 比例朝目标走 EWMA 一步(步长 `gain`),永不跳变;变化超过 1% 才值得通过 `FecReconfig` 通告对端。**这正是 Raptun 相对 kcptun 的核心优势**——直接读 Quinn 精确遥测区分随机 vs 拥塞,而 kcptun 跑在 KCP 之上看不到底层真实拥塞状态,只能盲猜。

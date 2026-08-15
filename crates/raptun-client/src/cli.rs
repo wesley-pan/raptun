@@ -111,6 +111,12 @@ pub struct Cli {
     #[arg(long)]
     pub block_size: Option<u16>,
 
+    /// Fraction of cwnd that in-flight repair traffic may occupy (the budget
+    /// brake). Clamped to [0.05, 0.40]: above 0.40 repair competes with data
+    /// hard enough to *cause* the congestion it is meant to repair.
+    #[arg(long = "repair-cwnd-frac", default_value_t = 0.20)]
+    pub repair_cwnd_frac: f64,
+
     // ---- Transport (QUIC) ------------------------------------------------
     /// Congestion controller.
     #[arg(long, value_enum, default_value_t = CcArg::Bbr)]
@@ -140,12 +146,21 @@ pub struct Cli {
     #[arg(long, default_value_t = 1024)]
     pub max_streams: u32,
 
-    /// UDP socket buffer size (bytes).
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    /// UDP socket buffer size (bytes). Kept RTT-scale, not seconds-scale: an
+    /// oversized OS queue hides the link from BBR and tail-drops in bursts.
+    /// If throughput drops, step up gradually (e.g. 1 MiB); do not return to
+    /// 4 MiB.
+    #[arg(long, default_value_t = 512 * 1024)]
     pub sockbuf: u32,
 
-    /// Keep-alive interval in seconds; 0 disables.
-    #[arg(long, default_value_t = 10)]
+    /// Quinn datagram send-buffer size (bytes). Same bufferbloat trade-off as
+    /// --sockbuf: too large queues seconds of symbols locally; too small parks
+    /// the send loop on normal bursts.
+    #[arg(long = "dgram-sndbuf", default_value_t = 2 * 1024 * 1024)]
+    pub dgram_sndbuf: usize,
+
+    /// Keep-alive interval in seconds; 0 disables. Must be < --idle-timeout.
+    #[arg(long, default_value_t = 3)]
     pub keepalive: u64,
 
     /// Interval in seconds for the periodic connection-status heartbeat log
@@ -154,8 +169,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 30)]
     pub heartbeat: u64,
 
-    /// Idle timeout in seconds before an idle connection is dropped.
-    #[arg(long, default_value_t = 30)]
+    /// Idle timeout in seconds before an idle connection is dropped. Must be
+    /// > --keepalive so keepalives arrive before the deadline.
+    #[arg(long, default_value_t = 10)]
     pub idle_timeout: u64,
 
     /// Allow QUIC connection migration (survives client IP changes).
@@ -225,6 +241,7 @@ pub struct FileFec {
     pub max: Option<f64>,
     pub symbol_size: Option<u16>,
     pub block_size: Option<u16>,
+    pub repair_cwnd_frac: Option<f64>,
 }
 
 /// `[transport]` section of the client config file.
@@ -238,6 +255,7 @@ pub struct FileTransport {
     pub conn_rwnd: Option<u64>,
     pub max_streams: Option<u32>,
     pub sockbuf: Option<u32>,
+    pub dgram_sndbuf: Option<usize>,
     pub keepalive: Option<u64>,
     pub idle_timeout: Option<u64>,
     pub heartbeat: Option<u64>,
@@ -379,6 +397,11 @@ impl Cli {
                 self.block_size = Some(v);
             }
         }
+        if from_default("repair_cwnd_frac") {
+            if let Some(v) = file.fec.repair_cwnd_frac {
+                self.repair_cwnd_frac = v;
+            }
+        }
 
         // [transport]
         if from_default("cc") {
@@ -414,6 +437,11 @@ impl Cli {
         if from_default("sockbuf") {
             if let Some(v) = file.transport.sockbuf {
                 self.sockbuf = v;
+            }
+        }
+        if from_default("dgram_sndbuf") {
+            if let Some(v) = file.transport.dgram_sndbuf {
+                self.dgram_sndbuf = v;
             }
         }
         if from_default("keepalive") {
@@ -454,7 +482,19 @@ impl Cli {
     ///
     /// Precedence (CLI > env > file > default) is realized by clap's `env`
     /// hooks plus the [`Cli::merge_file`] pass, which must have already run.
-    pub fn to_runtime_config(&self) -> RuntimeConfig {
+    ///
+    /// Errors when `keepalive >= idle_timeout` (a keepalive that never fires
+    /// before the deadline makes every connection die at idle_timeout; see
+    /// docs/TROUBLESHOOTING_STALLS.md).
+    pub fn to_runtime_config(&self) -> anyhow::Result<RuntimeConfig> {
+        if self.keepalive > 0 && self.keepalive >= self.idle_timeout {
+            anyhow::bail!(
+                "--keepalive ({}s) must be < --idle-timeout ({}s), or the \
+                 connection is torn down before a keepalive can refresh it",
+                self.keepalive,
+                self.idle_timeout
+            );
+        }
         let scheme = match self.fec {
             FecSchemeArg::Off => FecScheme::Off,
             FecSchemeArg::Raptorq => FecScheme::RaptorQ,
@@ -481,7 +521,7 @@ impl Cli {
             },
             symbol_size: self.symbol_size,
             block_size: self.block_size,
-            repair_cwnd_fraction: 0.40,
+            repair_cwnd_fraction: clamp_repair_frac(self.repair_cwnd_frac),
         };
 
         let transport = TransportConfig {
@@ -492,6 +532,7 @@ impl Cli {
             conn_recv_window: self.conn_rwnd,
             max_concurrent_streams: self.max_streams,
             socket_buffer: self.sockbuf,
+            datagram_send_buffer: self.dgram_sndbuf,
             keepalive: (self.keepalive > 0).then(|| Duration::from_secs(self.keepalive)),
             idle_timeout: Duration::from_secs(self.idle_timeout),
             // Server-only forwarding knob; the client never connects to a
@@ -506,7 +547,7 @@ impl Cli {
             ..TransportConfig::default()
         };
 
-        RuntimeConfig {
+        Ok(RuntimeConfig {
             fec,
             transport,
             // Resolve any "env:VAR" prefix on the PSK here so it works
@@ -515,8 +556,23 @@ impl Cli {
             // (merge_parsed), so `--psk env:RAPTUN_PSK` on the CLI was
             // sent literally and `psk_matches` failed on length.
             psk: self.psk.clone().and_then(resolve_secret),
-        }
+        })
     }
+}
+
+/// Clamp `--repair-cwnd-frac` to its safe range, warning when out of bounds.
+/// Above 0.40 repair traffic competes with data hard enough to *cause* the
+/// congestion it repairs; below 0.05 NACK recovery starves.
+fn clamp_repair_frac(v: f64) -> f64 {
+    let clamped = v.clamp(0.05, 0.40);
+    if (clamped - v).abs() > f64::EPSILON {
+        tracing::warn!(
+            requested = v,
+            using = clamped,
+            "--repair-cwnd-frac out of range [0.05, 0.40]; clamped"
+        );
+    }
+    clamped
 }
 
 /// Parse a config-file string into a clap [`ValueEnum`], mapping failures to a
@@ -580,6 +636,112 @@ mod tests {
         );
         assert!(matches!(cli.fec_mode, FecModeArg::Fixed));
         assert_eq!(cli.fec_ratio, 0.25);
+    }
+
+    #[test]
+    fn new_phase1_flags_merge_from_file() {
+        let cli = merged(
+            &["raptun-client", "-r", "10.0.0.1:29900"],
+            "[fec]\nrepair_cwnd_frac = 0.15\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(
+            cli.repair_cwnd_frac, 0.15,
+            "file [fec].repair_cwnd_frac must apply"
+        );
+        assert_eq!(
+            cli.dgram_sndbuf, 1048576,
+            "file [transport].dgram_sndbuf must apply"
+        );
+        // CLI beats file:
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.30",
+                "--dgram-sndbuf",
+                "524288",
+            ],
+            "[fec]\nrepair_cwnd_frac = 0.15\n[transport]\ndgram_sndbuf = 1048576\n",
+        );
+        assert_eq!(cli.repair_cwnd_frac, 0.30);
+        assert_eq!(cli.dgram_sndbuf, 524288);
+    }
+
+    #[test]
+    fn phase1_defaults_are_tuned() {
+        let cli = merged(&["raptun-client", "-r", "10.0.0.1:29900"], "");
+        assert_eq!(cli.sockbuf, 512 * 1024, "sockbuf default must be 512 KiB");
+        assert_eq!(cli.dgram_sndbuf, 2 * 1024 * 1024);
+        assert_eq!(cli.repair_cwnd_frac, 0.20);
+        assert_eq!(cli.keepalive, 3);
+        assert_eq!(cli.idle_timeout, 10);
+        // Wiring into RuntimeConfig:
+        let rc = cli.to_runtime_config().expect("valid defaults");
+        assert_eq!(rc.transport.socket_buffer, 512 * 1024);
+        assert_eq!(rc.transport.datagram_send_buffer, 2 * 1024 * 1024);
+        assert!((rc.fec.repair_cwnd_fraction - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keepalive_must_be_less_than_idle_timeout() {
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--keepalive",
+                "10",
+                "--idle-timeout",
+                "10",
+            ],
+            "",
+        );
+        assert!(
+            cli.to_runtime_config().is_err(),
+            "keepalive >= idle_timeout must be rejected"
+        );
+        // keepalive = 0 (disabled) is exempt from the check.
+        let cli = merged(
+            &["raptun-client", "-r", "10.0.0.1:29900", "--keepalive", "0"],
+            "",
+        );
+        assert!(cli.to_runtime_config().is_ok());
+    }
+
+    #[test]
+    fn repair_cwnd_frac_is_clamped() {
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.9",
+            ],
+            "",
+        );
+        let rc = cli.to_runtime_config().unwrap();
+        assert!(
+            (rc.fec.repair_cwnd_fraction - 0.40).abs() < 1e-9,
+            "must clamp to 0.40"
+        );
+        let cli = merged(
+            &[
+                "raptun-client",
+                "-r",
+                "10.0.0.1:29900",
+                "--repair-cwnd-frac",
+                "0.01",
+            ],
+            "",
+        );
+        let rc = cli.to_runtime_config().unwrap();
+        assert!(
+            (rc.fec.repair_cwnd_fraction - 0.05).abs() < 1e-9,
+            "must clamp to 0.05"
+        );
     }
 
     #[test]
