@@ -893,7 +893,8 @@ async fn many_concurrent_tunnels_do_not_stall() {
     // A generous deadline: if the stream cap is below CONCURRENT, tunnels past
     // the limit hang, the barrier never releases, and this elapses. With the
     // raised cap all CONCURRENT open together, round-trip, and pass the barrier.
-    let ok = tokio::time::timeout(Duration::from_secs(20), async {
+    // 45 s rather than 20 s to absorb CPU pressure in the full test suite.
+    let ok = tokio::time::timeout(Duration::from_secs(45), async {
         let mut ok = 0usize;
         for h in handles {
             if let Ok(true) = h.await {

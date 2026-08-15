@@ -169,6 +169,22 @@ pub struct Cli {
     #[arg(long, default_value_t = 30)]
     pub heartbeat: u64,
 
+    /// Loss rate (0.0-1.0) above which a stall-watchdog sample counts as bad.
+    /// The watchdog closes the connection after --stall-ticks consecutive bad
+    /// samples, forcing a fast reconnect: a flapping link keeps answering
+    /// keepalives, so the idle timeout never rescues it.
+    #[arg(long, default_value_t = 0.30)]
+    pub stall_loss: f64,
+
+    /// Consecutive bad watchdog samples before the connection is torn down;
+    /// 0 disables the watchdog. Time to trip = this x --stall-interval.
+    #[arg(long, default_value_t = 5)]
+    pub stall_ticks: u32,
+
+    /// Seconds between stall-watchdog loss samples.
+    #[arg(long, default_value_t = 2)]
+    pub stall_interval: u64,
+
     /// Idle timeout in seconds before an idle connection is dropped. Must be
     /// > --keepalive so keepalives arrive before the deadline.
     #[arg(long, default_value_t = 10)]
@@ -542,6 +558,16 @@ impl Cli {
             allow_0rtt: self.zero_rtt,
             dscp: self.dscp,
             heartbeat: (self.heartbeat > 0).then(|| Duration::from_secs(self.heartbeat)),
+            // Clamp rather than reject: an out-of-range threshold is a typo,
+            // not a reason to refuse to start a tunnel. The floor of 0.05 stops
+            // a `--stall-loss 0` from making every sample "bad" and closing the
+            // connection on a perfectly healthy link.
+            stall_loss_threshold: self.stall_loss.clamp(0.05, 1.0),
+            stall_ticks: self.stall_ticks,
+            // Floor at 1 s: sub-second sampling shrinks the measurement window
+            // until a single late packet dominates the loss ratio, which is how
+            // a watchdog starts tripping on noise.
+            stall_check_interval: Duration::from_secs(self.stall_interval.max(1)),
             // Loss-detection / reordering knobs use their tuned defaults; they
             // are not (yet) exposed as CLI flags.
             ..TransportConfig::default()

@@ -278,7 +278,7 @@ pub const MAX_PENDING_STREAMS: usize = 1024;
 /// (M1). Generous by design — one head-of-queue block plus a few in-flight
 /// repairs is well under 100 symbols for the default K=16; 1024 covers a
 /// very large K with a much-slowed receiver.
-pub const ROUTE_CAPACITY: usize = 1024;
+pub const ROUTE_CAPACITY: usize = 8192;
 
 struct HubInner {
     routes: HashMap<StreamId, mpsc::Sender<InboundSymbol>>,
@@ -371,36 +371,54 @@ impl DatagramHub {
         self.inner.lock().unwrap().pending.len()
     }
 
-    /// Route one received datagram. Symbols for a not-yet-registered stream are
-    /// buffered (up to a cap) and replayed when the stream registers.
+    /// Route one received datagram for a **registered** stream.
+    ///
+    /// Returns `Some((sender, symbol))` if the stream is registered, with the
+    /// hub lock already released. The caller must `.send(symbol).await` on the
+    /// returned sender: awaiting outside the lock is what prevents the
+    /// deadlock that `try_send` inside `dispatch` was working around. When the
+    /// channel is full the caller parks here until the downstream task drains
+    /// one slot — that backpressure propagates to Quinn's receive window so the
+    /// remote sender naturally slows down instead of having symbols dropped.
+    ///
+    /// Returns `None` for unregistered streams. The caller should then call
+    /// [`Self::dispatch`] to buffer the symbol in the pending map.
+    pub fn dispatch_route(
+        &self,
+        datagram: &[u8],
+    ) -> Option<(mpsc::Sender<InboundSymbol>, InboundSymbol)> {
+        let Ok((hdr, payload)) = SymbolHeader::parse(datagram) else {
+            return None;
+        };
+        let sym = (hdr.block_id, hdr.esi, Bytes::copy_from_slice(payload));
+        let inner = self.inner.lock().unwrap();
+        if let Some(tx) = inner.routes.get(&hdr.stream_id) {
+            // Clone is cheap (Arc refcount bump). Drop the lock before the
+            // caller awaits so other tunnels' dispatches are not blocked.
+            let tx = tx.clone();
+            drop(inner);
+            Some((tx, sym))
+        } else {
+            None
+        }
+    }
+
+    /// Buffer a datagram for a **not-yet-registered** stream.
+    ///
+    /// Symbols for registered streams must go through [`Self::dispatch_route`]
+    /// so the send can be awaited outside the mutex. This method handles only
+    /// the pending-buffer path for streams whose route has not been registered
+    /// yet; calling it for a registered stream is a no-op (the symbol is
+    /// silently dropped).
     pub fn dispatch(&self, datagram: &[u8]) {
         let Ok((hdr, payload)) = SymbolHeader::parse(datagram) else {
             return;
         };
         let sym = (hdr.block_id, hdr.esi, Bytes::copy_from_slice(payload));
         let mut inner = self.inner.lock().unwrap();
-        if let Some(tx) = inner.routes.get(&hdr.stream_id) {
-            // try_send (not send().await) because we're inside the HubInner
-            // mutex — awaiting here would deadlock the whole hub. A full
-            // channel means the consumer is wedged; dropping the new symbol
-            // is the right back-pressure (FEC will surface the missing
-            // symbol via the receiver's NACK path on its next tick).
-            match tx.try_send(sym) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(
-                        stream_id = hdr.stream_id,
-                        cap = ROUTE_CAPACITY,
-                        "symbol dropped: route channel full (consumer wedged?)"
-                    );
-                    return;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // Route is gone (guard dropped, mid-iteration). Just
-                    // let the next sweep clean it up.
-                    return;
-                }
-            }
+        // Registered streams are handled by dispatch_route; skip them here.
+        if inner.routes.contains_key(&hdr.stream_id) {
+            return;
         }
         // Unknown stream — buffer only if both we don't already have a slot
         // for it AND we're under the distinct-stream cap. The cap matters
@@ -511,7 +529,7 @@ pub struct FecSender {
 /// geometry, since each block is retained as both an encoder and a raw payload
 /// copy), so a few hundred concurrent large transfers exhausted RAM. Bounding
 /// by bytes keeps the worst case predictable regardless of concurrency.
-const SENDER_RETAIN_BYTES: u64 = 4 * 1024 * 1024;
+const SENDER_RETAIN_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Maximum number of proactive repair spurts a single block may receive. After
 /// this cap the sender stops主动补喷 for that block and lets the receiver's
@@ -942,6 +960,14 @@ impl FecReceiver {
             out.push(TunnelSignal::ReliableRequest { block: block_id });
         }
         out
+    }
+
+    /// Remove `block_id` from the reliable-requested set so that a later
+    /// [`Self::tick`] call will emit a fresh [`TunnelSignal::ReliableRequest`]
+    /// for it. Call this when `rel_req_tx.try_send` drops the request — the
+    /// block must not stay permanently stranded in the set.
+    pub fn unmark_reliable_requested(&mut self, block_id: BlockId) {
+        self.reliable_requested.remove(&block_id);
     }
 
     /// Inject a block's bytes delivered reliably via
@@ -1446,13 +1472,18 @@ mod tests {
 
     #[test]
     fn hub_routes_known_stream_and_drops_excess_per_stream() {
-        // For a registered stream, dispatch delivers symbols to its channel.
-        // Beyond MAX_PENDING_PER_STREAM for an *unregistered* stream, the
-        // per-stream symbol cap kicks in and the rest are dropped — the
-        // legitimate start-of-tunnel burst is well under this.
+        // For a registered stream, dispatch_route returns the sender so the
+        // caller can await outside the lock. dispatch() itself is now only for
+        // unregistered streams.
         let hub = DatagramHub::new();
-        let _guard = hub.register(42);
-        hub.dispatch(&datagram_for(42, 1, 0));
+        let guard = hub.register(42);
+        // dispatch_route returns Some for the registered stream.
+        let result = hub.dispatch_route(&datagram_for(42, 1, 0));
+        assert!(
+            result.is_some(),
+            "dispatch_route must return Some for a registered stream"
+        );
+        drop(guard);
         // Unknown stream: fill to per-stream cap, then verify the cap holds.
         for i in 0..(MAX_PENDING_PER_STREAM + 5) {
             hub.dispatch(&datagram_for(99, i as u64, 0));
@@ -1463,6 +1494,59 @@ mod tests {
             Some(MAX_PENDING_PER_STREAM),
             "per-stream pending must stop at MAX_PENDING_PER_STREAM"
         );
+    }
+
+    /// Regression test for the drop-on-full → in-order stall → credit freeze
+    /// deadlock. When the route channel is full, `dispatch_route` must return
+    /// a sender whose `.send().await` blocks (parks) rather than dropping the
+    /// symbol. This ensures that a slow downstream task propagates backpressure
+    /// to the QUIC receive loop rather than corrupting the FEC delivery
+    /// frontier.
+    #[tokio::test]
+    async fn dispatch_route_parks_on_full_channel() {
+        let hub = DatagramHub::new();
+        let mut guard = hub.register(55);
+
+        // Extract the receiver while keeping the guard alive (dropping the
+        // guard would unregister the route, making dispatch_route return None).
+        let mut rx = guard.take_rx();
+
+        // Saturate the route channel: send ROUTE_CAPACITY symbols through
+        // dispatch_route + send() so the channel is exactly full.
+        for esi in 0..(ROUTE_CAPACITY as u32) {
+            let dg = datagram_for(55, 0, esi);
+            let (tx, sym) = hub
+                .dispatch_route(&dg)
+                .expect("dispatch_route must return Some for stream 55");
+            tx.send(sym).await.expect("send must succeed while there is room");
+        }
+
+        // The channel is now full. Spawn a task that tries to send one more
+        // symbol; it should block until we drain a slot.
+        let hub2 = hub.clone();
+        let extra_dg = datagram_for(55, 0, ROUTE_CAPACITY as u32);
+        let send_task = tokio::spawn(async move {
+            let (tx, sym) = hub2
+                .dispatch_route(&extra_dg)
+                .expect("dispatch_route must return Some for registered stream");
+            tx.send(sym).await.ok();
+        });
+
+        // Give the task a moment to run and confirm it is parked (not done).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !send_task.is_finished(),
+            "send task must be parked on a full channel, not completed"
+        );
+
+        // Drain one slot — the parked send should now complete.
+        rx.recv().await.expect("must receive one symbol");
+        tokio::time::timeout(std::time::Duration::from_millis(200), send_task)
+            .await
+            .expect("send task must complete once a slot is freed")
+            .expect("send task must not panic");
+
+        drop(guard); // unregister after the test
     }
 
     /// H1 regression: a tunnel task that holds a `HubGuard` releases the

@@ -200,6 +200,87 @@ impl RegimeClassifier {
     }
 }
 
+/// Consecutive-bad-tick detector that decides when a connection is stalled
+/// badly enough to be worth tearing down and re-dialing.
+///
+/// # Why kill a connection that is technically still alive
+///
+/// Under the bufferbloat → tail-drop → repair-storm cycle the QUIC connection
+/// does not die: keepalives still get through, so the idle timeout never fires,
+/// and Quinn happily keeps a connection that is passing almost no useful data.
+/// The user sees a hang that lasts until something else finally breaks. A
+/// deliberate close converts that open-ended hang into a bounded one: the
+/// supervision loop re-dials on the fast backoff (200 ms, jittered) and the new
+/// connection starts with a cold cwnd and an empty local queue — which is
+/// exactly the state the stalled connection cannot reach on its own, because
+/// its own backlog is what keeps it stalled.
+///
+/// # Why a streak rather than a duration or an average
+///
+/// The trip condition must be *sustained* loss. Transient spikes are normal
+/// (one bad tick during a route change, a burst of cross traffic) and must
+/// never cost a reconnect — a watchdog that fires on noise is worse than no
+/// watchdog, since each spurious close drops every live tunnel on the
+/// connection. Requiring N consecutive bad ticks, with any single healthy tick
+/// clearing the streak, makes recovery strictly cheaper than tripping: the
+/// connection only dies if it fails to produce even one good tick in a row.
+///
+/// The watchdog is deliberately *not* cwnd-aware. The whole point of the
+/// tail-drop signature (§3.3 of the optimization plan) is that cwnd stays
+/// inflated while the link drowns, so gating on "cwnd is also low" would
+/// suppress the watchdog in precisely the scenario it exists for.
+#[derive(Debug)]
+pub struct StallWatchdog {
+    /// Loss rate above which a tick counts as "bad" (strictly greater).
+    loss_threshold: f64,
+    /// Consecutive bad ticks required to trip. Zero disables the watchdog.
+    ticks_to_trip: u32,
+    /// Current run of consecutive bad ticks.
+    streak: u32,
+    /// Latched once tripped, so a slow teardown can't fire a second close.
+    fired: bool,
+}
+
+impl StallWatchdog {
+    pub fn new(loss_threshold: f64, ticks_to_trip: u32) -> Self {
+        Self {
+            loss_threshold,
+            ticks_to_trip,
+            streak: 0,
+            fired: false,
+        }
+    }
+
+    /// Fold in one heartbeat sample; returns `true` exactly once, on the tick
+    /// that completes the bad streak.
+    ///
+    /// `loss` is `None` when the sample carries no measurement (the heartbeat's
+    /// first tick, before the loss baseline exists). Such a tick is skipped
+    /// entirely — it neither advances nor clears the streak — so the watchdog's
+    /// timing doesn't depend on when the baseline happened to be established.
+    pub fn observe(&mut self, loss: Option<f64>) -> bool {
+        if self.ticks_to_trip == 0 || self.fired {
+            return false;
+        }
+        let Some(loss) = loss else { return false };
+        if loss > self.loss_threshold {
+            self.streak += 1;
+            if self.streak >= self.ticks_to_trip {
+                self.fired = true;
+                return true;
+            }
+        } else {
+            self.streak = 0;
+        }
+        false
+    }
+
+    /// Current consecutive-bad-tick run, for logging.
+    pub fn streak(&self) -> u32 {
+        self.streak
+    }
+}
+
 /// Snapshot of the transport, as would be read from `quinn::Connection`.
 ///
 /// Kept as a plain struct so this module is unit-testable without a live
@@ -231,6 +312,72 @@ impl RegimeClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_trips_only_after_sustained_loss() {
+        // Threshold 30%, 3 consecutive ticks required.
+        let mut w = StallWatchdog::new(0.30, 3);
+        assert!(!w.observe(Some(0.50)), "one bad tick is not a stall");
+        assert!(!w.observe(Some(0.50)), "two bad ticks is not a stall yet");
+        assert!(w.observe(Some(0.50)), "third consecutive bad tick trips it");
+    }
+
+    #[test]
+    fn watchdog_resets_on_recovery() {
+        // A single healthy tick must clear the streak: transient loss spikes are
+        // normal and must never cost the user a reconnect.
+        let mut w = StallWatchdog::new(0.30, 3);
+        w.observe(Some(0.50));
+        w.observe(Some(0.50));
+        assert!(!w.observe(Some(0.01)), "recovery clears the streak");
+        assert!(!w.observe(Some(0.50)), "streak restarts from zero");
+        assert!(!w.observe(Some(0.50)));
+        assert!(w.observe(Some(0.50)), "needs 3 fresh consecutive ticks");
+    }
+
+    #[test]
+    fn watchdog_ignores_baseline_ticks() {
+        // `None` is "no measurement" (the heartbeat's first tick), not "0% loss"
+        // and not "bad". It must neither advance nor reset the streak — folding
+        // a baseline in either direction would make the watchdog's timing
+        // depend on when the loss baseline happened to be established.
+        let mut w = StallWatchdog::new(0.30, 3);
+        assert!(!w.observe(Some(0.50)));
+        assert!(!w.observe(None), "baseline is not a bad tick");
+        assert!(!w.observe(Some(0.50)));
+        assert!(
+            w.observe(Some(0.50)),
+            "the None tick was skipped, not counted as recovery"
+        );
+    }
+
+    #[test]
+    fn watchdog_trips_at_most_once() {
+        // After tripping, the caller closes the connection and the task ends.
+        // Latch so a slow teardown can't fire a second close.
+        let mut w = StallWatchdog::new(0.30, 2);
+        w.observe(Some(0.90));
+        assert!(w.observe(Some(0.90)));
+        assert!(!w.observe(Some(0.90)), "must not re-trip after firing");
+    }
+
+    #[test]
+    fn watchdog_loss_exactly_at_threshold_is_not_bad() {
+        // Strictly-greater comparison: a link sitting exactly at the configured
+        // threshold is at the edge of tolerated, not over it.
+        let mut w = StallWatchdog::new(0.30, 2);
+        assert!(!w.observe(Some(0.30)));
+        assert!(!w.observe(Some(0.30)), "at-threshold loss never trips");
+    }
+
+    #[test]
+    fn watchdog_disabled_never_trips() {
+        // ticks == 0 disables the watchdog entirely (operator escape hatch).
+        let mut w = StallWatchdog::new(0.30, 0);
+        for _ in 0..100 {
+            assert!(!w.observe(Some(0.99)), "disabled watchdog must never trip");
+        }
+    }
 
     #[test]
     fn cwnd_cut_is_congestion() {

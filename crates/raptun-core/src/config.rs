@@ -157,6 +157,21 @@ pub struct TransportConfig {
     /// liveness signal at `info` level: a healthy tunnel is otherwise silent
     /// after startup, so operators see no rolling output confirming it works.
     pub heartbeat: Option<Duration>,
+    /// Loss rate (0.0–1.0) above which a watchdog tick counts as "bad".
+    ///
+    /// The watchdog exists because a flapping connection does not die on its
+    /// own: keepalives keep getting through, so the idle timeout never fires,
+    /// and QUIC holds open a connection that is passing almost no useful data.
+    /// See [`crate::telemetry::StallWatchdog`].
+    pub stall_loss_threshold: f64,
+    /// Consecutive bad watchdog ticks (at [`Self::stall_check_interval`])
+    /// required before the client tears the connection down and re-dials.
+    /// `0` disables the watchdog.
+    pub stall_ticks: u32,
+    /// How often the stall watchdog samples loss. Deliberately independent of
+    /// [`Self::heartbeat`], which is an operator-facing log cadence (30 s by
+    /// default) far too slow to drive recovery.
+    pub stall_check_interval: Duration,
 }
 
 impl Default for TransportConfig {
@@ -182,6 +197,15 @@ impl Default for TransportConfig {
             min_mtu: 1200,
             initial_rtt: None,
             heartbeat: Some(Duration::from_secs(30)),
+            // 30% loss sustained across 5 × 2 s = 10 s. Both numbers are set so
+            // the watchdog fires only on a genuinely wedged link: 30% loss is
+            // far outside anything a healthy path produces, and requiring ten
+            // unbroken seconds of it means a single good tick anywhere in the
+            // window spares the connection. The cost of a false positive is
+            // dropping every live tunnel, so the bar is deliberately high.
+            stall_loss_threshold: 0.30,
+            stall_ticks: 5,
+            stall_check_interval: Duration::from_secs(2),
         }
     }
 }

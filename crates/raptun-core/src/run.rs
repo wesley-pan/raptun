@@ -209,6 +209,21 @@ async fn serve_connection(
         );
     }
 
+    // Stall watchdog: independent of the heartbeat because the heartbeat is an
+    // operator-facing log cadence (30 s) far too slow to drive recovery. The
+    // watchdog samples on its own short interval and closes the connection on
+    // sustained loss, converting an open-ended hang into a bounded one — the
+    // supervision loop then re-dials on the fast jittered backoff with a cold
+    // cwnd and an empty queue. See `StallWatchdog`.
+    if config.transport.stall_ticks > 0 {
+        spawn_stall_watchdog(
+            Arc::clone(&conn),
+            config.transport.stall_loss_threshold,
+            config.transport.stall_ticks,
+            config.transport.stall_check_interval,
+        );
+    }
+
     // M2: collect every per-tunnel task into a JoinSet so we can abort them
     // all when the connection scope ends. `JoinSet::Drop` aborts every still-
     // running task, so the right-shutdown semantics are "live tunnels die
@@ -427,6 +442,73 @@ fn spawn_client_heartbeat(
                 }
                 closed = conn.closed() => {
                     tracing::debug!(reason = %closed, "heartbeat stopping (connection closed)");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the client stall watchdog: sample loss at `interval` and close the
+/// connection after `ticks` consecutive samples above `threshold`.
+///
+/// # Why this owns a private `LossTracker`
+///
+/// It cannot share the connection-wide tracker. That one is advanced by every
+/// per-tunnel downstream task on a 20 ms tick, so by the time the watchdog read
+/// it the measurement window would be those 20 ms — a denominator so small that
+/// one late packet reads as 100% loss. The watchdog would then trip on noise
+/// and drop every live tunnel. A private tracker means each `observe` covers
+/// the full `interval` (2 s by default), which is a stable enough sample to act
+/// on. The cost is one extra `conn.stats()` read per interval.
+///
+/// Closing is the entire point, not a failure path: the supervision loop in
+/// `run_client` treats a closed connection as "re-dial", and the fresh
+/// connection gets the cold cwnd and empty local queue that the wedged one
+/// could never reach on its own.
+fn spawn_stall_watchdog(
+    conn: Arc<quinn::Connection>,
+    threshold: f64,
+    ticks: u32,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate t=0 tick
+        let mut watchdog = crate::telemetry::StallWatchdog::new(threshold, ticks);
+        // Private tracker: see the doc comment above.
+        let mut tracker = crate::telemetry::LossTracker::new();
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let stats = conn.stats();
+                    let loss = tracker
+                        .window_loss(stats.path.sent_packets, stats.path.lost_packets);
+                    if watchdog.observe(loss) {
+                        tracing::warn!(
+                            loss_pct = loss.map(|l| format!("{:.2}", l * 100.0)),
+                            threshold_pct = format!("{:.2}", threshold * 100.0),
+                            ticks,
+                            interval_ms = interval.as_millis(),
+                            "stall watchdog: sustained heavy loss; closing connection to force a fast reconnect"
+                        );
+                        // Application-level close. The supervision loop sees the
+                        // connection end and re-dials on the fast backoff.
+                        conn.close(0u32.into(), b"stall watchdog");
+                        break;
+                    }
+                    if watchdog.streak() > 0 {
+                        tracing::debug!(
+                            streak = watchdog.streak(),
+                            ticks,
+                            loss_pct = loss.map(|l| format!("{:.2}", l * 100.0)),
+                            "stall watchdog: bad tick"
+                        );
+                    }
+                }
+                closed = conn.closed() => {
+                    tracing::debug!(reason = %closed, "stall watchdog stopping (connection closed)");
                     break;
                 }
             }
@@ -735,7 +817,38 @@ const CREDIT_WINDOW_FLOOR_BLOCKS: u64 = 16;
 /// the sender to its pre-credit behaviour, never deadlock it. The reliable
 /// signaling stream already guarantees eventual credit delivery; this is a
 /// further backstop for pathological credit delay.
-const CREDIT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const CREDIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After a catastrophic loss event (e.g. BBR cwnd inflation on loopback with
+/// netem), blocks sent at the old high cwnd are never delivered — credits for
+/// them will never arrive. If the cwnd-stall fallback spin loop (`credit_fresh
+/// = false`, `has_cwnd_room() = false`) has been spinning for this long, the
+/// tunnel's in-flight count is forcibly cleared (`abandon_in_flight`). This
+/// prevents permanent deadlock when the connection's cwnd collapses well below
+/// the number of already-in-flight blocks.
+const CWND_STALL_ABANDON: Duration = Duration::from_secs(10);
+
+/// Slots in the per-tunnel reliable-retransmit *request* queue (signal reader →
+/// upstream task). Requests are 8-byte block ids, so the queue costs almost
+/// nothing; it is sized to absorb a whole recovery clump without dropping.
+///
+/// Overflow is not fatal — the tick re-requests dropped ids next cycle — but
+/// each drop costs a full tick of stall on a tunnel that is *already* in
+/// trouble, which is what turns one congestion episode into the observed
+/// hang → recover → hang flapping.
+const REL_REQ_QUEUE: usize = 1024;
+
+/// Slots in the per-tunnel reliable-retransmit *data* queue (signal reader →
+/// downstream task). Each message carries one full block payload (~18–20 KiB at
+/// the default geometry), so this is the one fallback queue with a real memory
+/// cost: 32 slots ≈ 640 KiB per tunnel worst case, and only while a tunnel is
+/// actively recovering.
+///
+/// That trade is deliberate. At the previous depth of 4 (~80 KiB) a single
+/// congestion episode overflowed the queue immediately, dropping retransmits
+/// that then had to be re-requested a tick later — recovery crawled exactly
+/// when it needed to be fast. Memory is the cheaper resource here.
+const REL_DATA_QUEUE: usize = 32;
 
 /// Hard upper bound on how long a single FEC tunnel may go *without making
 /// progress* before it is forcibly closed. This is a stall deadline, NOT an
@@ -768,7 +881,21 @@ fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
             match conn.read_datagram().await {
                 Ok(dg) => {
                     tracing::trace!(len = dg.len(), "datagram received");
-                    hub.dispatch(&dg);
+                    if let Some((tx, sym)) = hub.dispatch_route(&dg) {
+                        // try_send so we never park the read loop; a full
+                        // channel means the downstream task is slow, and
+                        // parking here would starve every other tunnel.
+                        // The FEC receiver's NACK + reliable-retransmit path
+                        // handles any dropped symbols.
+                        if tx.try_send(sym).is_err() {
+                            tracing::warn!(
+                                "symbol dropped: route channel full (consumer wedged?)"
+                            );
+                        }
+                    } else {
+                        // Unregistered stream: buffer for later replay.
+                        hub.dispatch(&dg);
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "datagram reader stopped");
@@ -972,12 +1099,28 @@ async fn run_fec_tunnel(
     // sender and its retained block payloads). Bounded: if the upstream task
     // is slow to serve requests, the channel fills and the reader drops new
     // ones — the tick mechanism will re-request them next cycle.
-    let (rel_req_tx, mut rel_req_rx) = mpsc::channel::<u64>(32);
+    //
+    // Sized for the *recovery* burst, not the steady state. Fallback requests
+    // arrive in clumps: one congestion episode degrades many blocks at once and
+    // every one of them requests a reliable retransmit within the same tick or
+    // two. A queue that overflows during that clump silently drops requests, so
+    // those blocks wait a full tick to be re-requested — which is precisely when
+    // the tunnel is already stalled and the operator sees it "hang, then
+    // recover, then hang again". See the flapping analysis in
+    // docs/raptun-congestion-optimization-plan.md §3.4.
+    let (rel_req_tx, mut rel_req_rx) = mpsc::channel::<u64>(REL_REQ_QUEUE);
     // Reliable-retransmit data routed to the downstream task (which owns the
     // receiver and delivers in order). Bounded: each message carries a full
-    // block payload (up to ~20 KiB), so 4 slots = ~80 KiB max queued. If full,
-    // the reader drops the message and the tick re-requests it.
-    let (rel_data_tx, mut rel_data_rx) = mpsc::channel::<(u64, Vec<u8>)>(4);
+    // block payload, so the slot count times the block size is the memory cap
+    // (see `REL_DATA_QUEUE`). If full, the reader drops the message and the
+    // tick re-requests it.
+    let (rel_data_tx, mut rel_data_rx) = mpsc::channel::<(u64, Vec<u8>)>(REL_DATA_QUEUE);
+    // Reliable-request unmark: when a ReliableRequest message is dropped
+    // (try_send overflow in the signal reader) or cannot be served (block
+    // evicted from sender), send the block_id back to the down task so
+    // `FecReceiver::unmark_reliable_requested` clears it — otherwise the
+    // block stays permanently in reliable_requested and tick never retries.
+    let (unmark_tx, mut unmark_rx) = mpsc::unbounded_channel::<u64>();
     // Flow-control credit routed from the signal reader to the upstream task:
     // the peer's cumulative delivered-block high-water. `up` gates production so
     // in-flight blocks stay bounded (see `CREDIT_WINDOW_BLOCKS`).
@@ -1047,6 +1190,7 @@ async fn run_fec_tunnel(
     // control-channel failure — e.g. the server resetting the stream because it
     // could not reach its target — apart from the normal end-of-stream that
     // follows a completed transfer.
+    let reader_unmark_tx = unmark_tx.clone();
     let reader = async move {
         let mut sig_recv = sig_recv;
         let mut buf: Vec<u8> = Vec::new();
@@ -1080,6 +1224,7 @@ async fn run_fec_tunnel(
                             TunnelSignal::ReliableRequest { block } => {
                                 if let Err(e) = rel_req_tx.try_send(block) {
                                     tracing::debug!(block, error = %e, "rel_req channel full; tick will retry");
+                                    let _ = reader_unmark_tx.send(block);
                                 }
                             }
                             TunnelSignal::ReliableData { block, bytes } => {
@@ -1110,6 +1255,14 @@ async fn run_fec_tunnel(
     let up_conn = conn.clone();
     let up_sig = sig_tx.clone();
     let up_window = Arc::clone(send_window);
+    // This tunnel's registration in the connection-wide send window. It bounds
+    // the tunnel to its fair share of the window (so one bulk flow cannot pin
+    // the whole thing and starve every other tunnel) and, on drop, releases any
+    // blocks still in flight — a tunnel killed mid-transfer never sends the
+    // credits that would settle them, and leaked blocks would shrink the usable
+    // window permanently. Held by the `up` task, whose lifetime is exactly the
+    // tunnel's sending lifetime.
+    let up_slot = up_window.register_tunnel();
     let up_budget = Arc::clone(budget);
     let up_link_state = Arc::clone(conn_link_state);
     let up_stats = stats.clone();
@@ -1177,15 +1330,21 @@ async fn run_fec_tunnel(
                         // later credit re-arms the gate. So a delayed/lost credit
                         // can only degrade to the pre-credit behaviour, never
                         // deadlock. TCP reads pausing here IS the back-pressure.
-                        while credit_fresh && !up_window.has_room() {
+                        while credit_fresh && !up_window.has_room(&up_slot) {
                             let probe = tokio::time::sleep(CREDIT_PROBE_TIMEOUT);
+                            // Re-check has_room periodically even without a credit.
+                            // Connection ceiling drops when OTHER tunnels settle their
+                            // in-flight blocks — this tunnel would never receive that
+                            // credit directly and would wait the full probe timeout
+                            // otherwise (see many_concurrent_tunnels_do_not_stall).
+                            let recheck = tokio::time::sleep(Duration::from_millis(20));
                             tokio::select! {
                                 c = credit_rx.recv() => {
                                     match c {
                                         Some(d) => {
                                             let newly = d.saturating_sub(delivered);
                                             delivered = delivered.max(d);
-                                            up_window.settle(newly);
+                                            up_window.settle(&up_slot, newly);
                                             credit_fresh = true;
                                             if let Some(s) = &up_stats {
                                                 s.set_delivered(delivered);
@@ -1203,9 +1362,48 @@ async fn run_fec_tunnel(
                                     );
                                     break;
                                 }
+                                _ = recheck => {
+                                    // Re-check has_room in the loop condition.
+                                }
                             }
                         }
-                        up_window.add_sent();
+                        // Even without credits, respect the cwnd ceiling to
+                        // prevent an unconstrained flood when the receiver's
+                        // ticker is stalled (TCP back-pressure starvation).
+                        // Spin-yield until the ceiling has room; a credit
+                        // arrival re-arms the gate and takes over gating.
+                        //
+                        // Abandon-on-stall: after a catastrophic loss event
+                        // (e.g. BBR cwnd inflation → netem queue overflow →
+                        // cwnd collapse), blocks sent at the old high cwnd are
+                        // permanently lost — credits for them will never arrive.
+                        // If we've been spinning for CWND_STALL_ABANDON, release
+                        // this tunnel's in-flight count so the gate can reopen.
+                        let cwnd_stall_start = Instant::now();
+                        while !up_window.has_cwnd_room() {
+                            tokio::task::yield_now().await;
+                            // Re-arm if a credit arrived while we yielded.
+                            if let Ok(d) = credit_rx.try_recv() {
+                                let newly = d.saturating_sub(delivered);
+                                delivered = delivered.max(d);
+                                up_window.settle(&up_slot, newly);
+                                credit_fresh = true;
+                                if let Some(s) = &up_stats {
+                                    s.set_delivered(delivered);
+                                }
+                                break;
+                            }
+                            if cwnd_stall_start.elapsed() >= CWND_STALL_ABANDON {
+                                tracing::debug!(
+                                    in_flight = up_window.in_flight(),
+                                    ceiling = up_window.ceiling(),
+                                    "cwnd stall: abandoning stranded in-flight blocks"
+                                );
+                                up_slot.abandon_in_flight();
+                                break;
+                            }
+                        }
+                        up_window.add_sent(&up_slot);
                         for dg in sender.encode_one_block(chunk, repair) {
                             send_datagram_paced(&up_conn, dg).await;
                         }
@@ -1243,6 +1441,10 @@ async fn run_fec_tunnel(
                 Some(block) = rel_req_rx.recv() => {
                     if let Some(bytes) = sender.reliable_payload(block) {
                         let _ = up_sig.send(TunnelSignal::ReliableData { block, bytes });
+                    } else {
+                        // Block was evicted from sender's retain window; tell the
+                        // down task to unmark it so tick() re-requests next cycle.
+                        let _ = unmark_tx.send(block);
                     }
                 }
                 // Drain flow-control credits even when not gating, so the shared
@@ -1250,7 +1452,7 @@ async fn run_fec_tunnel(
                 Some(d) = credit_rx.recv() => {
                     let newly = d.saturating_sub(delivered);
                     delivered = delivered.max(d);
-                    up_window.settle(newly);
+                    up_window.settle(&up_slot, newly);
                     credit_fresh = true;
                     if let Some(s) = &up_stats {
                         s.set_delivered(delivered);
@@ -1432,7 +1634,36 @@ async fn run_fec_tunnel(
                                 if let Some(s) = &down_stats {
                                     s.add_bytes_down(out.len() as u64);
                                 }
-                                tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
+                                // Write to TCP while keeping the ticker alive.
+                                // A blocked write_all starves ticker.tick(), so
+                                // credits stop flowing and the sender's probe
+                                // timeout disables flow-control gating — leading
+                                // to an unconstrained flood. Race the write
+                                // against the ticker so credits are emitted even
+                                // when TCP back-pressure stalls delivery.
+                                let mut written = 0;
+                                while written < out.len() {
+                                    tokio::select! {
+                                        biased;
+                                        res = tcp_write.write(&out[written..]) => {
+                                            let n = res.map_err(CoreError::Io)?;
+                                            if n == 0 {
+                                                return Err(CoreError::Io(std::io::Error::new(
+                                                    std::io::ErrorKind::WriteZero,
+                                                    "TCP write returned 0",
+                                                )));
+                                            }
+                                            written += n;
+                                        }
+                                        _ = ticker.tick() => {
+                                            let delivered = receiver.highest_delivered();
+                                            if delivered != last_credit_sent && !test_should_drop_credit() {
+                                                let _ = down_sig.send(TunnelSignal::Credit { delivered });
+                                                last_credit_sent = delivered;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             // A block may have decoded from this symbol:
                             // ack it immediately so the sender can release
@@ -1465,13 +1696,40 @@ async fn run_fec_tunnel(
                         if let Some(s) = &down_stats {
                             s.add_bytes_down(out.len() as u64);
                         }
-                        tcp_write.write_all(&out).await.map_err(CoreError::Io)?;
+                        let mut written = 0;
+                        while written < out.len() {
+                            tokio::select! {
+                                biased;
+                                res = tcp_write.write(&out[written..]) => {
+                                    let n = res.map_err(CoreError::Io)?;
+                                    if n == 0 {
+                                        return Err(CoreError::Io(std::io::Error::new(
+                                            std::io::ErrorKind::WriteZero,
+                                            "TCP write returned 0",
+                                        )));
+                                    }
+                                    written += n;
+                                }
+                                _ = ticker.tick() => {
+                                    let delivered = receiver.highest_delivered();
+                                    if delivered != last_credit_sent && !test_should_drop_credit() {
+                                        let _ = down_sig.send(TunnelSignal::Credit { delivered });
+                                        last_credit_sent = delivered;
+                                    }
+                                }
+                            }
+                        }
                     }
                     // A reliably-completed block is also done: ack it
                     // so the sender releases its state.
                     for block in receiver.drain_acks() {
                         let _ = down_sig.send(TunnelSignal::BlockAck { block });
                     }
+                }
+                // Unmark a reliable-request that was dropped or could not be
+                // served so tick() re-emits the request next cycle.
+                Some(block) = unmark_rx.recv() => {
+                    receiver.unmark_reliable_requested(block);
                 }
                 _ = ticker.tick() => {
                     // Refresh telemetry-derived link state + budget ceiling, then
@@ -1484,6 +1742,9 @@ async fn run_fec_tunnel(
                         &down_conn,
                         &mut down_loss_tracker.lock().expect("loss tracker poisoned"),
                     );
+                    // Update the shared connection-level BDP proxy. The cap is
+                    // applied inside refresh_ceiling via the stored minimum.
+                    down_window.observe_cwnd(sample.cwnd_bytes);
                     let link = classifier.to_link_state(sample);
                     budget.refresh_ceiling(link.cwnd_bytes());
                     // Publish the live regime snapshot for the upstream task's
