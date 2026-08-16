@@ -888,9 +888,7 @@ fn spawn_datagram_reader(conn: Arc<quinn::Connection>, hub: DatagramHub) {
                         // The FEC receiver's NACK + reliable-retransmit path
                         // handles any dropped symbols.
                         if tx.try_send(sym).is_err() {
-                            tracing::warn!(
-                                "symbol dropped: route channel full (consumer wedged?)"
-                            );
+                            tracing::warn!("symbol dropped: route channel full (consumer wedged?)");
                         }
                     } else {
                         // Unregistered stream: buffer for later replay.
@@ -1575,7 +1573,23 @@ async fn run_fec_tunnel(
                 // has arrived for TUNNEL_MAX_STALL, so a slow-but-progressing
                 // drain is left to finish.
                 _ = lifetime_tick.tick() => {
-                    if last_progress_at.elapsed() > TUNNEL_MAX_STALL {
+                    // Fast path: every block we sent has been decoded and acked
+                    // by the peer. `down_done_rx` is the "polite" exit, but on
+                    // short-lived tunnels (1-block HTTP requests through the
+                    // tunnel) it can fail to fire promptly because the peer's
+                    // `down` task waits for `highest_delivered() >= total` AND
+                    // a clean `tcp_write.shutdown()` round-trip — and the
+                    // peer can race to close first. Bailing here lets the
+                    // 120 s stall guard stay as a true fallback for genuinely
+                    // stuck receivers, instead of the dominant cost.
+                    if sender.acked_blocks() >= total_blocks {
+                        tracing::debug!(
+                            total_blocks,
+                            acked_blocks = sender.acked_blocks(),
+                            "tunnel done: all blocks acked"
+                        );
+                        break;
+                    } else if last_progress_at.elapsed() > TUNNEL_MAX_STALL {
                         tracing::warn!(
                             total_blocks,
                             delivered,

@@ -792,6 +792,131 @@ async fn run_downstream_first_scenario() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 }
 
+// === SHORTTUNNEL_MARKER ===
+/// Regression for the 2026-08-16 live-test bug: a short single-block tunnel
+/// (e.g. a typical HTTP request/response) was holding its QUIC bidi stream
+/// open for a full `TUNNEL_MAX_STALL` (120 s) of dead air after the BlockAck
+/// round-trip, because the post-EOF stall guard had no "done" signal.
+///
+/// The fix adds an `acked_blocks` counter on the sender, advanced by each
+/// `BlockAck` via `retire_block`. Once the counter reaches the locally-sent
+/// `total_blocks`, the post-EOF `up` task breaks immediately. With the fix a
+/// clean short tunnel (echo request + response + local close) must drain
+/// `active_tunnels` back to 0 well within 10 seconds. Without it, the tunnel
+/// waits the full 120 s and the test times out.
+#[tokio::test(flavor = "current_thread")]
+async fn short_tunnel_tears_down_within_a_few_seconds() {
+    let _guard = E2E_LOCK.lock().await;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("raptun_core=info")
+        .with_writer(BufWriter(buf.clone()))
+        .with_ansi(false)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    run_short_tunnel_scenario().await;
+
+    let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let counts: Vec<u64> = logs
+        .lines()
+        .filter(|l| l.contains("tunnel alive"))
+        .filter_map(|l| {
+            l.split("active_tunnels=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    let rose = counts.iter().position(|&c| c >= 1);
+    let drained_after_rise = rose.map(|i| counts[i..].contains(&0)).unwrap_or(false);
+    assert!(
+        drained_after_rise,
+        "short tunnel must drain to 0 quickly; \
+         active_tunnels sequence = {counts:?}\nlogs:\n{logs}"
+    );
+}
+
+/// Drive one short request/response through the FEC tunnel against an echo
+/// target, close the local side cleanly, and wait. With the post-EOF `acked`
+/// fix in place, the tunnel's `up` task should break on its next
+/// `lifetime_tick` (~5 s) after the BlockAck round-trip completes. We give it
+/// 10 s of slack to absorb scheduler jitter on slow CI hosts.
+async fn run_short_tunnel_scenario() {
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+
+    let mut cfg = fec_config();
+    cfg.transport.heartbeat = Some(Duration::from_secs(1));
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_addr = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(
+            server_bind,
+            &identity,
+            transport,
+            &cfg.transport,
+        )
+        .unwrap();
+        ep.local_addr().unwrap()
+    };
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let local_addr = {
+        let l = TcpListener::bind(local_bind).await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // One short request, one short response, then keep the local socket open
+    // for a beat so the next heartbeat catches `active_tunnels >= 1`. Without
+    // this the round-trip and tear-down both fit *inside* one heartbeat window
+    // and the assertion never sees the rise.
+    {
+        let mut conn = connect_with_retry(local_addr).await;
+        conn.write_all(b"hi").await.unwrap();
+        let mut resp = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut resp))
+            .await
+            .expect("response read timed out")
+            .expect("response read failed");
+        assert_eq!(&resp[..n], b"HI", "echo must round-trip");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Dropping `conn` closes the local socket -> up sees EOF -> enters
+        // the post-EOF wait that the fix short-circuits.
+    }
+
+    // Give the post-EOF break time to happen. The fix means the tunnel drains
+    // within one lifetime_tick (~5 s) of the BlockAck round-trip; the buggy
+    // version would wait the full TUNNEL_MAX_STALL=120 s. 10 s is comfortably
+    // above the fix path and well below the bug path.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+}
+
 /// Concurrency regression: many local connections held open *simultaneously*
 /// must all tunnel data promptly, not stall until earlier ones close.
 ///

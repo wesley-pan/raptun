@@ -516,6 +516,15 @@ pub struct FecSender {
     /// How many proactive top-ups have been issued per retained block. Capped
     /// so proactive spurts do not infinite-loop before the NACK path takes over.
     proactive_counts: HashMap<BlockId, u32>,
+    /// Number of blocks the peer has acked (decoded). Monotonically non-
+    /// decreasing: each `BlockAck` increments via `retire_block`. When this
+    /// reaches `next_block`, every block this sender has ever produced has
+    /// been decoded, and the post-EOF `up` task can tear the tunnel down
+    /// without waiting the full 120 s stall timeout (which would otherwise
+    /// fire on every short-lived single-block tunnel — see the 2026-08-16
+    /// live test: 973 `tunnel stalled (post-EOF)` warns in 80 min, all
+    /// `total_blocks=1 delivered=1 stalled_s=120`).
+    acked_blocks: u64,
 }
 
 /// Upper bound on the *bytes* of source data a sender retains for possible NACK
@@ -550,6 +559,7 @@ impl FecSender {
             oldest_retained: 0,
             block_sent_at: HashMap::new(),
             proactive_counts: HashMap::new(),
+            acked_blocks: 0,
         }
     }
 
@@ -653,6 +663,15 @@ impl FecSender {
         self.payloads.remove(&block_id);
         self.block_sent_at.remove(&block_id);
         self.proactive_counts.remove(&block_id);
+        self.acked_blocks = self.acked_blocks.saturating_add(1);
+    }
+
+    /// Number of blocks the peer has acked (decoded). When this reaches
+    /// `next_block` the post-EOF `up` task can break out of its stall guard
+    /// immediately instead of waiting `TUNNEL_MAX_STALL`. See
+    /// `acked_blocks` field docs for the live-test context.
+    pub fn acked_blocks(&self) -> u64 {
+        self.acked_blocks
     }
 
     /// Return blocks that should receive a proactive repair spurt.
@@ -1436,6 +1455,46 @@ mod tests {
         );
     }
 
+    /// `retire_block` advances the per-sender acked counter monotonically. The
+    /// post-EOF `up` task uses this counter to break out of its 120 s stall
+    /// guard as soon as every block has been acked (regression test for the
+    /// 2026-08-16 live-test bug: 973 short tunnels each waited the full 120 s
+    /// because the post-EOF stall guard had no "done" signal).
+    #[test]
+    fn retire_block_advances_acked_counter() {
+        let mut sender = FecSender::new(1, SYM, 4);
+        assert_eq!(sender.acked_blocks(), 0, "fresh sender has 0 acked blocks");
+
+        // Retiring is unconditional + saturating: a BlockAck from the peer is
+        // trusted (the peer is the authority on "I decoded this"), so the
+        // counter advances even if the block was already evicted by the
+        // retention window. The post-EOF break only requires the counter to
+        // reach `next_block` — if eviction lost the payload but the ack still
+        // arrives, the sender has nothing more to do anyway.
+        sender.retire_block(999);
+        assert_eq!(sender.acked_blocks(), 1, "retire advances the counter");
+
+        // Retiring the same id twice still advances the counter; saturating
+        // addition prevents any future overflow.
+        sender.retire_block(7);
+        sender.retire_block(7);
+        assert_eq!(
+            sender.acked_blocks(),
+            3,
+            "retire is monotonic and saturating"
+        );
+
+        // Retiring many distinct ids advances the counter by one each time.
+        for id in 0..10 {
+            sender.retire_block(id);
+        }
+        assert_eq!(
+            sender.acked_blocks(),
+            13,
+            "counter is the total number of retire_block calls"
+        );
+    }
+
     /// Build a wire-format datagram that `DatagramHub::dispatch` will accept:
     /// a valid `SymbolHeader` followed by a small payload.
     fn datagram_for(stream: u64, block: u64, esi: u32) -> Vec<u8> {
@@ -1518,7 +1577,9 @@ mod tests {
             let (tx, sym) = hub
                 .dispatch_route(&dg)
                 .expect("dispatch_route must return Some for stream 55");
-            tx.send(sym).await.expect("send must succeed while there is room");
+            tx.send(sym)
+                .await
+                .expect("send must succeed while there is room");
         }
 
         // The channel is now full. Spawn a task that tries to send one more
