@@ -380,7 +380,19 @@ mod close_classification_tests {
 struct ActiveGuard<'a>(&'a AtomicU64);
 impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        // Trace at debug so future `active_tunnels` leaks are visible in
+        // the log stream next to the heartbeat. The `remaining` field
+        // makes the drop self-describing: it shows the counter value
+        // *after* the subtraction, so a stuck counter (drift between
+        // fetch_add and the count of drops over time) is visible at a
+        // glance. (Found and fixed in the 2026-08-16 1h live test:
+        // the previous post-EOF fix closed the stall-guard deadlock
+        // at `run.rs:1139`, but a second leak — a `down` task with no
+        // stall guard and a `down_done_rx` arm that exited `up` before
+        // the peer had acked everything — was leaking tunnels
+        // monotonically. See the 1h report.)
+        let remaining = self.0.fetch_sub(1, Ordering::Relaxed) - 1;
+        tracing::debug!(remaining, "ActiveGuard drop");
     }
 }
 
@@ -1523,6 +1535,22 @@ async fn run_fec_tunnel(
         // that just reached EOF would be killed by the very first post-EOF
         // tick (H4).
         last_progress_at = Instant::now();
+        // Whether the local `down` task has finished. Once true, the
+        // `down_done_rx` arm of the select below is suppressed (so we
+        // never busy-loop on an already-fired oneshot). The actual exit
+        // decision when `down_done_seen` is true is gated on
+        // `sender.acked_blocks() >= total_blocks`: the local `down` is
+        // done but the peer has not necessarily acked everything we
+        // sent. If the peer has not, the loop continues and the
+        // `lifetime_tick` arm (fast-break or stall guard) finishes the
+        // tunnel. This is the second `active_tunnels` leak fix: without
+        // this gate, the server-side `up` exits its post-EOF loop the
+        // moment the request is fully received, even if response blocks
+        // are still in flight (and may be lost), and the client's `down`
+        // waits forever because the server is no longer there to serve
+        // NACKs. (See `crates/raptun-core/src/run.rs` plan / 2026-08-16
+        // 1h report.)
+        let mut down_done_seen = false;
         loop {
             tokio::select! {
                 Some((block, need)) = nack_rx.recv() => {
@@ -1562,12 +1590,41 @@ async fn run_fec_tunnel(
                     sender.retire_block(block);
                     last_progress_at = Instant::now();
                 }
-                // Downstream finished: stop serving late repairs and unwind so
-                // the sig_tx clones drop, writer.finish() cascades EOF to the
-                // peer, and `ActiveGuard` can drop (fixes active_tunnels leak).
-                // `&mut` so a not-yet-fired receiver can be re-polled next
-                // iteration; a fired/closed receiver resolves immediately.
-                _ = &mut down_done_rx => break,
+                // Downstream finished: the local `down` task is done. On a
+                // well-behaved short tunnel the peer has also acked
+                // everything we sent, so we can unwind. On the server
+                // side, however, `down_done_rx` fires when the client's
+                // *request* is fully received — the response may still
+                // be in flight or partially lost, and the client is now
+                // waiting on the response. Unconditionally breaking here
+                // is the second `active_tunnels` leak: the server drops
+                // its `FecSender` state, the client can never recover the
+                // missing response blocks, the client's `down` loops
+                // forever, the `data` future hangs in `tokio::join!`,
+                // and `ActiveGuard` is never dropped.
+                //
+                // Gate the break: only break once every sent block has
+                // been acked. Otherwise set `down_done_seen` (so this
+                // arm is suppressed on subsequent iterations — a fired
+                // `oneshot` resolves immediately and would otherwise
+                // busy-loop) and let the `lifetime_tick` arm's
+                // fast-break or 120-s stall guard finish the tunnel.
+                _ = &mut down_done_rx, if !down_done_seen => {
+                    down_done_seen = true;
+                    if sender.acked_blocks() >= total_blocks {
+                        tracing::debug!(
+                            total_blocks,
+                            acked_blocks = sender.acked_blocks(),
+                            "tunnel done: local down finished after all blocks acked"
+                        );
+                        break;
+                    }
+                    // else: do nothing this iteration. The
+                    // `lifetime_tick` arm below keeps firing; the
+                    // fast-break will fire as soon as the peer acks the
+                    // outstanding blocks, or the stall guard will fire
+                    // at TUNNEL_MAX_STALL.
+                }
                 // Stall guard also applies post-EOF: the receiver might be stuck
                 // and never send `down_done_rx`. Abort only after no BlockAck
                 // has arrived for TUNNEL_MAX_STALL, so a slow-but-progressing
@@ -1632,6 +1689,21 @@ async fn run_fec_tunnel(
         // Tick cadence for the convergence arbitration.
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Stall guard: `down` has no upper bound on its own (it loops
+        // on the 20 ms ticker forever), so without this guard a peer
+        // that stops sending and never closes the inbound channel
+        // (e.g. the server-side `up` already exited via the gated
+        // `down_done_rx` arm above, leaving the client waiting on
+        // datagrams that will never arrive) makes this task hang
+        // forever. The `tokio::join!(up, down, writer)` in the outer
+        // `data` future then hangs with it, and `ActiveGuard` is
+        // never dropped — the second `active_tunnels` leak. Symmetric
+        // to the `up`-side `TUNNEL_MAX_STALL` guard, re-using the
+        // same constant.
+        let mut last_progress_at: Instant = Instant::now();
+        let mut last_progress_delivered: u64 = 0;
+        let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             if let Some(total) = expected {
@@ -1789,6 +1861,38 @@ async fn run_fec_tunnel(
                     if delivered != last_credit_sent && !test_should_drop_credit() {
                         let _ = down_sig.send(TunnelSignal::Credit { delivered });
                         last_credit_sent = delivered;
+                    }
+                }
+                // Stall guard (symmetric to the `up`-side guard at
+                // `run.rs:1494-1508` and the fast-break / stall-guard
+                // in the post-EOF `lifetime_tick` arm). Progress means
+                // either the receiver advanced its `highest_delivered`
+                // since the last progress tick, *or* we now know the
+                // total block count from a `BlockCount` signal (so the
+                // peer told us what to expect, even if the last block
+                // itself has not arrived). Without a `total_known`
+                // exemption, a one-block short tunnel that has fully
+                // delivered the only block but whose `BlockCount` is
+                // still buffered ahead of it would look stalled for
+                // 120 s — same H4-style pattern the `up` guard already
+                // handles. If progress truly stalls, the post-loop
+                // body (`tcp_write.shutdown()` + `down_done_tx.send(())`)
+                // runs, freeing `up` via the oneshot and letting the
+                // outer `data` future complete.
+                _ = progress_tick.tick() => {
+                    let advanced = receiver.highest_delivered() > last_progress_delivered;
+                    let total_known = expected.is_some();
+                    if advanced || total_known {
+                        last_progress_delivered = receiver.highest_delivered();
+                        last_progress_at = Instant::now();
+                    } else if last_progress_at.elapsed() > TUNNEL_MAX_STALL {
+                        tracing::warn!(
+                            delivered = receiver.highest_delivered(),
+                            expected = ?expected,
+                            stalled_s = last_progress_at.elapsed().as_secs(),
+                            "down stalled: peer stopped delivering; tearing down tunnel"
+                        );
+                        break;
                     }
                 }
             }

@@ -917,6 +917,157 @@ async fn run_short_tunnel_scenario() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 }
 
+// === DOWNSTALL_MARKER ===
+
+/// Regression for the 2026-08-16 1h live test: under datagram loss the `down`
+/// task used to hang forever waiting for a block the peer would never
+/// deliver (because the server-side `up` had already exited via the
+/// `down_done_rx` arm while the peer had not yet acked everything), and
+/// the `data` future's `tokio::join!(up, down, writer)` hung with it.
+/// `ActiveGuard` was never dropped and `active_tunnels` grew monotonically.
+/// (Live test: 30× drift against `lsof`.)
+///
+/// This test forces high loss on a small-but-multi-block payload and
+/// asserts that `active_tunnels` returns to 0 within
+/// `TUNNEL_MAX_STALL + slack`. Without the new down-side stall guard
+/// (added alongside the post-EOF `down_done_rx` arm gate in commit
+/// following `5d7a91c`), this test would hang for the duration of
+/// `TUNNEL_MAX_STALL` *or longer* (the up-side fast-break and the
+/// new gated `down_done_rx` arm cover the server side, but the
+/// client-side `down` task is what was actually hanging in the 1h
+/// test, and that is what this regression targets).
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "current_thread")]
+async fn down_stall_guard_releases_tunnel_under_loss() {
+    let _guard = E2E_LOCK.lock().await;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("raptun_core=info")
+        .with_writer(BufWriter(buf.clone()))
+        .with_ansi(false)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    // Drop 1 in 2 datagrams in both directions so a non-trivial number
+    // of blocks are lost in flight. With a 1-block payload the new
+    // post-EOF fast-break would rescue the test on its own; we want a
+    // multi-block payload so the `down` task is genuinely waiting on
+    // a peer that may not be able to satisfy the recovery.
+    raptun_core::run::set_test_drop_one_in(2);
+
+    let echo_addr = spawn_echo().await;
+    let identity = ServerIdentity::generate_self_signed("raptun").unwrap();
+    let fingerprint = identity.fingerprint_hex.clone();
+
+    let mut cfg = fec_config();
+    cfg.transport.heartbeat = Some(Duration::from_secs(1));
+    // Bump repair ratio so most loss is still recoverable on a
+    // multi-block payload (the stall guard should not fire in a
+    // healthy FEC run; it should only fire when the peer really is
+    // gone). If the test routinely trips the stall guard we are
+    // seeing a different bug.
+    cfg.fec.initial_ratio = raptun_fec::strategy::RepairRatio::from_fraction(0.5);
+
+    let server_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server_addr = {
+        let transport = raptun_core::endpoint::build_transport(&cfg.transport).unwrap();
+        let ep = raptun_core::endpoint::build_server_endpoint(
+            server_bind,
+            &identity,
+            transport,
+            &cfg.transport,
+        )
+        .unwrap();
+        ep.local_addr().unwrap()
+    };
+
+    let srv_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_server(srv_cfg, server_addr, echo_addr, identity, None).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let local_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let local_addr = {
+        let l = TcpListener::bind(local_bind).await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let trust = ServerTrust::Fingerprint(fingerprint);
+    let cli_cfg = cfg.clone();
+    tokio::spawn(async move {
+        let _ = raptun_core::run_client(
+            cli_cfg,
+            local_addr,
+            server_addr,
+            "raptun",
+            trust,
+            ListenMode::Tcp,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A multi-block payload (a few K symbols) so loss can straddle
+    // block boundaries and the receiver is genuinely waiting on
+    // specific datagrams.
+    let payload: Vec<u8> = (0..8_000u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut conn = connect_with_retry(local_addr).await;
+        conn.write_all(&payload).await.unwrap();
+        // Read until the echo completes or 30 s elapse. Under 1-in-2
+        // loss the test still expects recovery; if recovery fails
+        // outright the test will time out before the stall guard
+        // fires, which is the wrong signal.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < payload.len() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, conn.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                _ => break,
+            }
+        }
+    }
+
+    // Always disable loss injection for any subsequent test in this
+    // process.
+    raptun_core::run::set_test_drop_one_in(0);
+
+    // Wait TUNNEL_MAX_STALL + slack so the down-side stall guard
+    // fires even on the hardest-to-recover block. Without the
+    // down-side stall guard (and without the post-EOF fast-break
+    // fix in the previous commit), this is exactly the path that
+    // was hanging in the 2026-08-16 1h live test.
+    tokio::time::sleep(Duration::from_secs(150)).await;
+
+    let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let counts: Vec<u64> = logs
+        .lines()
+        .filter(|l| l.contains("tunnel alive"))
+        .filter_map(|l| {
+            l.split("active_tunnels=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    let rose = counts.iter().position(|&c| c >= 1);
+    let drained_after_rise = rose.map(|i| counts[i..].contains(&0)).unwrap_or(false);
+    assert!(
+        drained_after_rise,
+        "active_tunnels must drain to 0 within TUNNEL_MAX_STALL + slack; \
+         active_tunnels sequence = {counts:?}\nlogs:\n{logs}"
+    );
+}
+
 /// Concurrency regression: many local connections held open *simultaneously*
 /// must all tunnel data promptly, not stall until earlier ones close.
 ///
