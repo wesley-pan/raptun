@@ -4,6 +4,19 @@
 #   CLI flag  >  environment variable  >  this file  >  built-in default
 #
 # Pass with:  raptun-server -c raptun-server.example.toml
+#
+# Phase-1 tuning: the Phase-1 congestion optimisation plan landed defaults of
+# sockbuf=512 KiB, keepalive=3 s, idle_timeout=10 s, repair_cwnd_frac=0.20
+# (see docs/raptun-congestion-optimization-plan.md §5). This example mirrors
+# those defaults so anyone copying it gets the optimised behaviour.
+#
+# Notes on the values below:
+#   * symbol_size=1100: this is the *effective* negotiated value. The server
+#     clamps any value above SAFE_MAX_SYMBOL_SIZE=1100
+#     (crates/raptun-core/src/session.rs `clamp_fec`) so a framed symbol fits
+#     in one QUIC datagram. Setting 1100 here avoids the
+#     `clamp_fec: client symbol_size adjusted by server` warning that the
+#     Issue 2 fix added. MUST match the client.
 
 listen = "0.0.0.0:29900"
 target = "127.0.0.1:8080"                  # forward tunnelled TCP here (plain-TCP mode)
@@ -32,7 +45,8 @@ log_level   = "info"                       # error|warn|info|debug|trace
 [fec]
 scheme      = "raptorq"                    # off | raptorq | xor
 max         = 0.50                         # ceiling on repair overhead a client may request
-symbol_size = 1200                         # MUST match the client
+symbol_size = 1100                         # effective (server clamps 1200 -> 1100); MUST match the client
+repair_cwnd_frac = 0.20                    # Phase-1 default; range 0.10-0.40
 
 [transport]
 cc            = "bbr"                       # bbr | cubic | newreno
@@ -41,9 +55,10 @@ datagram      = true                        # false => reliable streams, FEC off
 stream_rwnd   = 2097152                     # 2 MiB
 conn_rwnd     = 16777216                    # 16 MiB
 max_streams   = 1024                        # concurrent tunnels per connection (each holds one bidi stream)
-sockbuf       = 4194304                     # 4 MiB UDP socket buffer
-keepalive     = 10                          # seconds; 0 disables
-idle_timeout  = 30
+sockbuf       = 524288                      # 512 KiB UDP socket buffer (Phase-1; was 4 MiB)
+dgram_sndbuf  = 2097152                     # 2 MiB datagram send buffer
+keepalive     = 3                           # seconds; 0 disables; must be < idle_timeout
+idle_timeout  = 10
 connect_timeout = 10                        # seconds to reach the forwarding target before resetting the tunnel
 migration     = true
 zero_rtt      = true
