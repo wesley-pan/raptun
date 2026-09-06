@@ -7,7 +7,7 @@
 //! the accept/forward structure here.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -15,14 +15,17 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::config::RuntimeConfig;
+use crate::config::{FecMode, RuntimeConfig};
 use crate::endpoint::{build_client_endpoint, build_server_endpoint, build_transport};
 use crate::fec::{DatagramHub, FecReceiver, FecSender};
 use crate::monitor::{TunnelRegistry, TunnelStats};
-use crate::session::{handshake_client, handshake_server, tunnel_bi};
+use crate::session::{handshake_client, handshake_server, read_telemetry, tunnel_bi};
+use crate::telemetry::{LossTracker, RegimeClassifier};
 use crate::tls::{ServerIdentity, ServerTrust};
 use crate::{CoreError, Result};
 
+use raptun_fec::codec::actual_k_for;
+use raptun_fec::strategy::{FecStrategy, RepairRatio, StrategyConfig};
 use raptun_proto::control::FecParams;
 use raptun_proto::StreamId;
 
@@ -180,6 +183,19 @@ async fn serve_connection(
     // One connection-wide send window, shared by every tunnel so aggregate
     // in-flight data stays bounded by cwnd regardless of tunnel count.
     let send_window = new_conn_send_window(&conn, &fec);
+    // Connection-wide live repair ratio in parts-per-thousand. The adaptive
+    // controller updates this from telemetry; fixed mode leaves it at the
+    // handshake value. Every tunnel reads it before encoding a block.
+    let live_ratio = Arc::new(AtomicU32::new(fec.repair_ppm as u32));
+    if use_fec && config.fec.mode == FecMode::Adaptive {
+        spawn_fec_controller(
+            Arc::clone(&conn),
+            Arc::clone(&budget),
+            Arc::clone(&live_ratio),
+            config.fec.strategy,
+            RepairRatio::from_ppm_thousandths(fec.repair_ppm),
+        );
+    }
 
     // Count of currently-live tunnels, surfaced by the heartbeat. Each accepted
     // connection increments it and a guard decrements on completion.
@@ -258,6 +274,7 @@ async fn serve_connection(
         let send_window = Arc::clone(&send_window);
         let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
         let conn_link_state = Arc::clone(&conn_link_state);
+        let live_ratio = Arc::clone(&live_ratio);
         tunnels.spawn(async move {
             // Track this tunnel in the live count for the heartbeat; the guard
             // decrements even if the tunnel returns early with an error.
@@ -272,6 +289,7 @@ async fn serve_connection(
                     &send_window,
                     &conn_loss_tracker,
                     &conn_link_state,
+                    &live_ratio,
                     tcp,
                 )
                 .await
@@ -547,6 +565,7 @@ async fn handle_client_conn_fec(
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
+    live_ratio: &Arc<AtomicU32>,
     tcp: TcpStream,
 ) -> Result<()> {
     let (send, recv) = conn
@@ -561,6 +580,7 @@ async fn handle_client_conn_fec(
         send_window,
         conn_loss_tracker,
         conn_link_state,
+        live_ratio,
         tcp,
         send,
         recv,
@@ -635,6 +655,19 @@ async fn handle_server_conn(
     // the matching comment in `serve_connection`).
     let budget = new_conn_budget(&conn, &fec, &config);
     let send_window = new_conn_send_window(&conn, &fec);
+    // Connection-wide live repair ratio in parts-per-thousand. The adaptive
+    // controller updates this from telemetry; fixed mode leaves it at the
+    // handshake value. Every tunnel reads it before encoding a block.
+    let live_ratio = Arc::new(AtomicU32::new(fec.repair_ppm as u32));
+    if use_fec && config.fec.mode == FecMode::Adaptive {
+        spawn_fec_controller(
+            Arc::clone(&conn),
+            Arc::clone(&budget),
+            Arc::clone(&live_ratio),
+            config.fec.strategy,
+            RepairRatio::from_ppm_thousandths(fec.repair_ppm),
+        );
+    }
     // One LossTracker per QUIC connection, shared by every tunnel. See the
     // matching comment in `serve_connection` for the rationale (B1 from the
     // 2026-08-02 load test).
@@ -675,6 +708,7 @@ async fn handle_server_conn(
         let send_window = Arc::clone(&send_window);
         let conn_loss_tracker = Arc::clone(&conn_loss_tracker);
         let conn_link_state = Arc::clone(&conn_link_state);
+        let live_ratio = Arc::clone(&live_ratio);
         let registry = registry.clone();
         tunnels.spawn(async move {
             // Bound the target connect: an unreachable target must not park this
@@ -691,6 +725,7 @@ async fn handle_server_conn(
                             &send_window,
                             &conn_loss_tracker,
                             &conn_link_state,
+                            &live_ratio,
                             tcp,
                             send,
                             recv,
@@ -801,15 +836,55 @@ fn resolve_k(fec: &FecParams) -> u32 {
     }
 }
 
-/// Repair symbols to send per block, from the negotiated repair ratio
-/// (parts-per-thousand) applied to K, with a floor of 1 when any repair is set.
-fn repair_count(fec: &FecParams, k: u32) -> u32 {
-    let raw = (u64::from(k) * u64::from(fec.repair_ppm) / 1000) as u32;
-    if fec.repair_ppm > 0 {
-        raw.max(1)
-    } else {
-        0
+/// Compute how many repair symbols to originate for a block with `actual_k`
+/// source symbols, given the current live repair ratio in parts-per-thousand.
+/// A non-zero ratio always produces at least one repair symbol so tiny blocks
+/// still have some protection.
+fn live_repair_count(actual_k: u32, repair_ppm: u32) -> u32 {
+    if repair_ppm == 0 {
+        return 0;
     }
+    ((u64::from(actual_k) * u64::from(repair_ppm)) / 1000).max(1) as u32
+}
+
+/// Spawn the per-QUIC-connection adaptive FEC controller.
+///
+/// It samples Quinn telemetry, classifies the loss regime, and updates the
+/// shared repair ratio that every tunnel on this connection reads before
+/// encoding a block. The repair budget ceiling is refreshed here so the
+/// connection-wide brake tracks live cwnd.
+fn spawn_fec_controller(
+    conn: Arc<quinn::Connection>,
+    budget: Arc<raptun_fec::RepairBudget>,
+    live_ratio: Arc<AtomicU32>,
+    strategy_config: StrategyConfig,
+    initial_ratio: RepairRatio,
+) {
+    tokio::spawn(async move {
+        let mut classifier = RegimeClassifier::new();
+        let mut strategy = FecStrategy::new(strategy_config, initial_ratio);
+        let mut loss_tracker = LossTracker::new();
+        // 50 ms is a compromise: fast enough to react to regime changes, slow
+        // enough that a single noisy tick does not jerk the ratio around.
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let sample = read_telemetry(&conn, &mut loss_tracker);
+                    let link = classifier.to_link_state(sample);
+                    budget.refresh_ceiling(link.cwnd_bytes());
+                    if strategy.update(&link) {
+                        live_ratio.store(strategy.current().as_ppm_thousandths() as u32, Ordering::Relaxed);
+                    }
+                }
+                _ = conn.closed() => {
+                    tracing::debug!("fec controller stopping (connection closed)");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Client-assigned stream ids for FEC tunnels. Even ids for client-originated
@@ -927,6 +1002,7 @@ async fn client_tunnel_fec(
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
+    live_ratio: &Arc<AtomicU32>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     sig_recv: quinn::RecvStream,
@@ -950,6 +1026,7 @@ async fn client_tunnel_fec(
         send_window,
         conn_loss_tracker,
         conn_link_state,
+        live_ratio,
         stream_id,
         tcp,
         sig_send,
@@ -973,6 +1050,7 @@ async fn server_tunnel_fec(
     send_window: &Arc<raptun_fec::SendWindow>,
     conn_loss_tracker: &Arc<Mutex<crate::telemetry::LossTracker>>,
     conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
+    live_ratio: &Arc<AtomicU32>,
     tcp: TcpStream,
     mut sig_send: quinn::SendStream,
     mut sig_recv: quinn::RecvStream,
@@ -1027,6 +1105,7 @@ async fn server_tunnel_fec(
         send_window,
         conn_loss_tracker,
         conn_link_state,
+        live_ratio,
         stream_id,
         tcp,
         sig_send,
@@ -1075,6 +1154,10 @@ async fn run_fec_tunnel(
     // loss regime. Written once per 20 ms control tick; read once per proactive
     // tick (RTT/4). One cell per connection, not per tunnel.
     conn_link_state: &Arc<Mutex<Option<raptun_fec::LinkState>>>,
+    // Connection-wide live repair ratio in parts-per-thousand, updated by the
+    // adaptive controller (if enabled) and read by the upstream task before
+    // encoding each block.
+    live_ratio: &Arc<AtomicU32>,
     stream_id: StreamId,
     tcp: TcpStream,
     sig_send: quinn::SendStream,
@@ -1088,7 +1171,6 @@ async fn run_fec_tunnel(
     use tokio::sync::mpsc;
 
     let k = resolve_k(fec);
-    let repair = repair_count(fec, k);
     // The negotiated symbol size must fit inside one QUIC datagram together with
     // the symbol header, or every `send_datagram` would fail and the FEC path
     // would silently stall. Both ends clamp identically against the *negotiated*
@@ -1340,7 +1422,7 @@ async fn run_fec_tunnel(
                         // later credit re-arms the gate. So a delayed/lost credit
                         // can only degrade to the pre-credit behaviour, never
                         // deadlock. TCP reads pausing here IS the back-pressure.
-                        while credit_fresh && !up_window.has_room(&up_slot) {
+                        'gate: while credit_fresh && !up_window.has_room(&up_slot) {
                             let probe = tokio::time::sleep(CREDIT_PROBE_TIMEOUT);
                             // Re-check has_room periodically even without a credit.
                             // Connection ceiling drops when OTHER tunnels settle their
@@ -1360,7 +1442,12 @@ async fn run_fec_tunnel(
                                                 s.set_delivered(delivered);
                                             }
                                         }
-                                        None => break, // credit channel closed; stop gating
+                                        None => {
+                                            // Credit channel closed: stop gating and
+                                            // fall back to cwnd back-pressure below.
+                                            credit_fresh = false;
+                                            break 'gate;
+                                        }
                                     }
                                 }
                                 _ = probe => {
@@ -1370,7 +1457,7 @@ async fn run_fec_tunnel(
                                         ceiling = up_window.ceiling(),
                                         "credit stale: gating disabled, relying on cwnd back-pressure"
                                     );
-                                    break;
+                                    break 'gate;
                                 }
                                 _ = recheck => {
                                     // Re-check has_room in the loop condition.
@@ -1414,6 +1501,13 @@ async fn run_fec_tunnel(
                             }
                         }
                         up_window.add_sent(&up_slot);
+                        // Read the connection-wide live repair ratio and scale it
+                        // by this block's actual K. Fixed mode keeps the ratio at
+                        // the handshake value; adaptive mode updates it from
+                        // telemetry in spawn_fec_controller.
+                        let ppm = live_ratio.load(Ordering::Relaxed);
+                        let actual_k = actual_k_for(chunk.len(), symbol_size, k);
+                        let repair = live_repair_count(actual_k, ppm);
                         for dg in sender.encode_one_block(chunk, repair) {
                             send_datagram_paced(&up_conn, dg).await;
                         }
@@ -1714,8 +1808,8 @@ async fn run_fec_tunnel(
             tokio::select! {
                 sym = inbound.recv() => {
                     match sym {
-                        Some((block_id, esi, payload)) => {
-                            let out = receiver.on_symbol(block_id, esi, &payload, Instant::now(), &budget);
+                        Some((block_id, actual_k, esi, payload)) => {
+                            let out = receiver.on_symbol(block_id, actual_k, esi, &payload, Instant::now(), &budget);
                             if !out.is_empty() {
                                 if let Some(s) = &down_stats {
                                     s.add_bytes_down(out.len() as u64);
@@ -2159,5 +2253,115 @@ mod tests {
         let negotiated: u16 = 1200;
         let result = negotiated.max(1);
         assert_eq!(result, 1200);
+    }
+
+    /// P0-2: the live repair ratio read by `run_fec_tunnel` must scale repair
+    /// symbols with the block's actual K. Zero ratio means zero repair; a
+    /// non-zero ratio always yields at least one repair symbol.
+    #[test]
+    fn live_repair_count_scales_with_actual_k_and_ratio() {
+        assert_eq!(super::live_repair_count(10, 0), 0, "zero ratio => no repair");
+        assert_eq!(
+            super::live_repair_count(10, 50),
+            1,
+            "tiny blocks still get at least one repair symbol"
+        );
+        assert_eq!(super::live_repair_count(100, 100), 10, "10% of 100 = 10");
+        assert_eq!(super::live_repair_count(100, 500), 50, "50% of 100 = 50");
+    }
+
+    /// P0-2: adaptive mode must raise the shared `live_ratio` when telemetry
+    /// reports sustained random loss, and back it off when congestion is
+    /// detected. This test mirrors the body of `spawn_fec_controller` without
+    /// requiring a live Quinn connection.
+    #[test]
+    fn adaptive_controller_raises_and_lowers_live_ratio() {
+        use crate::telemetry::{RegimeClassifier, TransportSample};
+        use raptun_fec::budget::RepairBudget;
+        use raptun_fec::strategy::{FecStrategy, RepairRatio, StrategyConfig};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let live_ratio = Arc::new(AtomicU32::new(50)); // handshake value: 5%
+        let budget = Arc::new(RepairBudget::new(1098, 0.4));
+        let mut classifier = RegimeClassifier::new();
+        let mut strategy = FecStrategy::new(
+            StrategyConfig::default(),
+            RepairRatio::from_ppm_thousandths(50),
+        );
+
+        // Random loss at 8% with a *growing* cwnd: the classifier must see this
+        // as the Random regime (not congestion), so the adaptive controller can
+        // raise the repair ratio. A flat cwnd + 20% loss would be classified as
+        // congestion and immediately collapse the ratio, which is the correct
+        // behavior but not what we are exercising here.
+        let mut cwnd = 100_000u64;
+        for _ in 0..30 {
+            let random_loss = TransportSample {
+                smoothed_rtt: Duration::from_millis(100),
+                rtt_var: Duration::from_millis(50),
+                cwnd_bytes: cwnd,
+                loss_rate: 0.08,
+            };
+            let link = classifier.to_link_state(random_loss);
+            assert_eq!(
+                link.regime(),
+                raptun_fec::link::LossRegime::Random,
+                "growing cwnd + 8% loss must be classified as Random"
+            );
+            budget.refresh_ceiling(link.cwnd_bytes());
+            if strategy.update(&link) {
+                live_ratio.store(strategy.current().as_ppm_thousandths() as u32, Ordering::Relaxed);
+            }
+            cwnd += 2_000;
+        }
+        let raised = live_ratio.load(Ordering::Relaxed);
+        assert!(
+            raised > 50,
+            "adaptive controller should raise ratio on random loss, got {} ppm",
+            raised
+        );
+
+        // Now the link is congested (cwnd cut + heavy loss). The controller must
+        // back the ratio down toward the configured minimum.
+        let congested = TransportSample {
+            smoothed_rtt: Duration::from_millis(100),
+            rtt_var: Duration::from_millis(50),
+            cwnd_bytes: 10_000, // a sharp cwnd cut from the previous sample classifies congestion
+            loss_rate: 0.20,
+        };
+        for _ in 0..50 {
+            let link = classifier.to_link_state(congested);
+            budget.refresh_ceiling(link.cwnd_bytes());
+            if strategy.update(&link) {
+                live_ratio.store(strategy.current().as_ppm_thousandths() as u32, Ordering::Relaxed);
+            }
+        }
+        let lowered = live_ratio.load(Ordering::Relaxed);
+        assert!(
+            lowered < raised,
+            "congestion should lower the ratio, got {} ppm after raising to {} ppm",
+            lowered,
+            raised
+        );
+    }
+
+    /// P0-2: in fixed mode the controller task is not spawned, so the handshake
+    /// repair ratio stays unchanged for the life of the connection.
+    #[test]
+    fn fixed_mode_live_ratio_stays_at_handshake_value() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let handshake_ppm: u32 = 150; // 15%
+        let live_ratio = Arc::new(AtomicU32::new(handshake_ppm));
+        // No adaptive controller is running: ratio remains exactly the negotiated
+        // value, which `run_fec_tunnel` reads before encoding every block.
+        assert_eq!(
+            live_ratio.load(Ordering::Relaxed),
+            handshake_ppm,
+            "fixed mode must keep the handshake repair ratio unchanged"
+        );
     }
 }

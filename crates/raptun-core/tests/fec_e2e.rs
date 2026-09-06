@@ -335,7 +335,7 @@ async fn fec_pump_direct_smoke() {
     let mut out = Vec::new();
     for dg in &dgs {
         let (h, p) = SymbolHeader::parse(dg).unwrap();
-        out.extend_from_slice(&r.on_symbol(h.block_id, h.esi, p, Instant::now(), &budget));
+        out.extend_from_slice(&r.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, Instant::now(), &budget));
     }
     assert_eq!(out, b"direct smoke test payload");
 }

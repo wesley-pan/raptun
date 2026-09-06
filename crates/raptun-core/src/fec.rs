@@ -231,14 +231,15 @@ impl TunnelSignal {
     }
 }
 
-use raptun_fec::codec::{max_payload, RaptorQBlockDecoderImpl, RaptorQBlockEncoder};
+use raptun_fec::codec::{actual_k_for, max_payload, RaptorQBlockDecoderImpl, RaptorQBlockEncoder};
 use raptun_fec::encoder::BlockEncoder;
 use raptun_fec::BlockManager;
 use raptun_proto::datagram::SymbolHeader;
 use raptun_proto::StreamId;
 
-/// One demultiplexed inbound symbol: its block, encoding-symbol id, and payload.
-pub type InboundSymbol = (BlockId, u32, Bytes);
+/// One demultiplexed inbound symbol: its block, actual source-block size,
+/// encoding-symbol id, and payload.
+pub type InboundSymbol = (BlockId, u32, u32, Bytes);
 
 /// Connection-level datagram demultiplexer.
 ///
@@ -390,7 +391,7 @@ impl DatagramHub {
         let Ok((hdr, payload)) = SymbolHeader::parse(datagram) else {
             return None;
         };
-        let sym = (hdr.block_id, hdr.esi, Bytes::copy_from_slice(payload));
+        let sym = (hdr.block_id, hdr.actual_k as u32, hdr.esi, Bytes::copy_from_slice(payload));
         let inner = self.inner.lock().unwrap();
         if let Some(tx) = inner.routes.get(&hdr.stream_id) {
             // Clone is cheap (Arc refcount bump). Drop the lock before the
@@ -414,7 +415,7 @@ impl DatagramHub {
         let Ok((hdr, payload)) = SymbolHeader::parse(datagram) else {
             return;
         };
-        let sym = (hdr.block_id, hdr.esi, Bytes::copy_from_slice(payload));
+        let sym = (hdr.block_id, hdr.actual_k as u32, hdr.esi, Bytes::copy_from_slice(payload));
         let mut inner = self.inner.lock().unwrap();
         // Registered streams are handled by dispatch_route; skip them here.
         if inner.routes.contains_key(&hdr.stream_id) {
@@ -502,6 +503,8 @@ pub struct FecSender {
     next_block: BlockId,
     /// Repair symbols already emitted per still-live block (for NACK top-ups).
     repair_sent: HashMap<BlockId, u32>,
+    /// Source-block size (actual K) each block was encoded with.
+    block_k: HashMap<BlockId, u32>,
     /// Retained encoders per block, so additional repair can be minted on NACK.
     encoders: HashMap<BlockId, RaptorQBlockEncoder>,
     /// Retained original payload bytes per block, so a stranded block can be
@@ -554,6 +557,7 @@ impl FecSender {
             k: k.max(1),
             next_block: 0,
             repair_sent: HashMap::new(),
+            block_k: HashMap::new(),
             encoders: HashMap::new(),
             payloads: HashMap::new(),
             oldest_retained: 0,
@@ -599,9 +603,14 @@ impl FecSender {
         let block_id = self.next_block;
         self.next_block += 1;
 
-        let encoder = RaptorQBlockEncoder::new(payload, self.symbol_size, self.k);
+        // Use only as many source symbols as the payload actually needs. This
+        // prevents a 100-byte message from being padded to a full K-symbol block
+        // and flooding the link with ~K datagrams.
+        let actual_k = actual_k_for(payload.len(), self.symbol_size, self.k);
+        let encoder = RaptorQBlockEncoder::new(payload, self.symbol_size, actual_k);
         let symbols = encoder.emit(self.stream_id, block_id, repair_count);
         self.repair_sent.insert(block_id, repair_count);
+        self.block_k.insert(block_id, actual_k);
         self.encoders.insert(block_id, encoder);
         // Retain the raw payload for a possible reliable-retransmit fallback.
         self.payloads.insert(block_id, payload.to_vec());
@@ -630,6 +639,7 @@ impl FecSender {
         for block_id in self.oldest_retained..cutoff {
             self.encoders.remove(&block_id);
             self.repair_sent.remove(&block_id);
+            self.block_k.remove(&block_id);
             self.payloads.remove(&block_id);
             self.block_sent_at.remove(&block_id);
             self.proactive_counts.remove(&block_id);
@@ -660,6 +670,7 @@ impl FecSender {
     pub fn retire_block(&mut self, block_id: BlockId) {
         self.encoders.remove(&block_id);
         self.repair_sent.remove(&block_id);
+        self.block_k.remove(&block_id);
         self.payloads.remove(&block_id);
         self.block_sent_at.remove(&block_id);
         self.proactive_counts.remove(&block_id);
@@ -699,9 +710,6 @@ impl FecSender {
         }
 
         let mut out = Vec::new();
-        // Conservative extra amount: enough to push a block toward decode but
-        // not so large that a single spurt can exhaust the repair budget.
-        let desired = (self.k / 4).max(1);
 
         for (&block_id, &sent_at) in &self.block_sent_at {
             // The encoder must still be retained (BlockAck retires it).
@@ -715,6 +723,11 @@ impl FecSender {
             if count >= PROACTIVE_TOPUP_CAP {
                 continue;
             }
+            // Conservative extra amount: enough to push a block toward decode but
+            // not so large that a single spurt can exhaust the repair budget.
+            // Scale by the block's actual K, not the negotiated maximum.
+            let actual_k = self.block_k.get(&block_id).copied().unwrap_or(self.k);
+            let desired = (actual_k / 4).max(1);
             if !budget.try_reserve(desired) {
                 continue;
             }
@@ -804,6 +817,7 @@ impl FecReceiver {
     pub fn on_symbol(
         &mut self,
         block_id: BlockId,
+        actual_k: u32,
         esi: u32,
         payload: &[u8],
         now: std::time::Instant,
@@ -816,7 +830,9 @@ impl FecReceiver {
         self.highest_seen = self.highest_seen.max(block_id);
 
         let symbol_size = self.symbol_size;
-        let k = self.k;
+        // The block was encoded with actual_k source symbols (≤ negotiated K).
+        // Use that, not the negotiated maximum, to size the decoder.
+        let k = actual_k.max(1).min(self.k);
         let mgr = self.managers.entry(block_id).or_insert_with(|| {
             let codec = Box::new(RaptorQBlockDecoderImpl::new(symbol_size, k));
             BlockManager::new(block_id, k, codec)
@@ -848,7 +864,7 @@ impl FecReceiver {
     }
 
     /// Access a block's manager for the control-tick arbitration (NACK /
-    /// degrade decisions) driven by [`crate::session::Session::control_tick`].
+    /// degrade decisions) driven by [`run_fec_tunnel`]'s downstream tick.
     pub fn manager_mut(&mut self, block_id: BlockId) -> Option<&mut BlockManager> {
         self.managers.get_mut(&block_id)
     }
@@ -1048,7 +1064,7 @@ mod tests {
             }
             let (hdr, payload) = SymbolHeader::parse(dg).unwrap();
             let delivered =
-                receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now(), &budget);
+                receiver.on_symbol(hdr.block_id, hdr.actual_k as u32, hdr.esi, payload, Instant::now(), &budget);
             assembled.extend_from_slice(&delivered);
         }
 
@@ -1056,6 +1072,46 @@ mod tests {
             assembled, msg,
             "FEC pump must recover the full stream in order"
         );
+    }
+
+    /// Short payloads must be encoded with a small actual K, not padded to the
+    /// negotiated maximum. This is the fix for the P0-1 bandwidth blow-up.
+    #[test]
+    fn short_payload_uses_small_actual_k() {
+        let mut sender = FecSender::new(1, SYM, K);
+        // A 100-byte payload needs only ceil((100 + 4) / 128) = 1 source symbol,
+        // not the full K = 6.
+        let payload = vec![0xABu8; 100];
+        let datagrams = sender.encode_one_block(&payload, 2);
+
+        let source_count = datagrams
+            .iter()
+            .filter(|dg| {
+                let (hdr, _) = SymbolHeader::parse(dg).unwrap();
+                hdr.esi < hdr.actual_k as u32
+            })
+            .count();
+        assert_eq!(
+            source_count, 1,
+            "100-byte payload must produce exactly 1 source symbol, not {K}"
+        );
+
+        // And it must round-trip.
+        let mut receiver = FecReceiver::new(SYM, K);
+        let budget = test_budget();
+        let mut assembled = Vec::new();
+        for dg in &datagrams {
+            let (hdr, p) = SymbolHeader::parse(dg).unwrap();
+            assembled.extend_from_slice(&receiver.on_symbol(
+                hdr.block_id,
+                hdr.actual_k as u32,
+                hdr.esi,
+                p,
+                Instant::now(),
+                &budget,
+            ));
+        }
+        assert_eq!(assembled, payload);
     }
 
     #[test]
@@ -1073,7 +1129,7 @@ mod tests {
         for dg in &datagrams {
             let (hdr, payload) = SymbolHeader::parse(dg).unwrap();
             let delivered =
-                receiver.on_symbol(hdr.block_id, hdr.esi, payload, Instant::now(), &budget);
+                receiver.on_symbol(hdr.block_id, hdr.actual_k as u32, hdr.esi, payload, Instant::now(), &budget);
             assembled.extend_from_slice(&delivered);
         }
         assert_eq!(assembled, msg);
@@ -1082,7 +1138,10 @@ mod tests {
     #[test]
     fn additional_repair_is_fresh_and_decodes() {
         // Send a block with too few symbols to decode, then top up via NACK path.
-        let payload: Vec<u8> = (0..400).map(|i| (i % 200) as u8).collect();
+        // Use a full-block payload so the block is encoded with the negotiated K.
+        let payload: Vec<u8> = (0..(SYM as usize * K as usize - 4))
+            .map(|i| (i % 200) as u8)
+            .collect();
         let mut sender = FecSender::new(1, SYM, K);
         let first = sender.encode_one_block(&payload, 0); // K source symbols only
 
@@ -1094,6 +1153,7 @@ mod tests {
             let (hdr, pay) = SymbolHeader::parse(dg).unwrap();
             assembled.extend_from_slice(&receiver.on_symbol(
                 hdr.block_id,
+                hdr.actual_k as u32,
                 hdr.esi,
                 pay,
                 Instant::now(),
@@ -1108,6 +1168,7 @@ mod tests {
             let (hdr, pay) = SymbolHeader::parse(dg).unwrap();
             assembled.extend_from_slice(&receiver.on_symbol(
                 hdr.block_id,
+                hdr.actual_k as u32,
                 hdr.esi,
                 pay,
                 Instant::now(),
@@ -1179,8 +1240,13 @@ mod tests {
         let mut sender = FecSender::new(1, SYM, K);
         // Block 0: only K-3 source symbols (undecodable). Block 1: full, so the
         // receiver's delivery pointer can advance and mark block 0 as behind.
-        let payload0: Vec<u8> = (0..500).map(|i| (i % 200) as u8).collect();
-        let payload1: Vec<u8> = (0..500).map(|i| (i % 190) as u8).collect();
+        // Use full-block payloads so both blocks are encoded with the negotiated K.
+        let payload0: Vec<u8> = (0..(SYM as usize * K as usize - 4))
+            .map(|i| (i % 200) as u8)
+            .collect();
+        let payload1: Vec<u8> = (0..(SYM as usize * K as usize - 4))
+            .map(|i| (i % 190) as u8)
+            .collect();
         let b0 = sender.encode_one_block(&payload0, 0);
         let b1 = sender.encode_one_block(&payload1, K);
 
@@ -1194,14 +1260,14 @@ mod tests {
         // Deliver K-3 symbols of block 0 (not enough).
         for dg in b0.iter().take((K - 3) as usize) {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+            receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, t0, &budget);
         }
         // Deliver block 1 fully; it decodes but cannot be delivered yet (block 0
         // is still missing and delivery is in-order). This does NOT advance the
         // delivery floor past block 0.
         for dg in &b1 {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+            receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, t0, &budget);
         }
 
         let link = LinkState::new(
@@ -1243,7 +1309,7 @@ mod tests {
         let mut delivered = Vec::new();
         for dg in &extra {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.esi, p, later, &budget));
+            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, later, &budget));
         }
         // Block 0 completes, unblocking in-order delivery of both blocks.
         let mut expected = payload0.clone();
@@ -1278,12 +1344,12 @@ mod tests {
                                    // One symbol of block 0 (far from decodable).
         {
             let (h, p) = SymbolHeader::parse(&b0[0]).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+            receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, t0, &budget);
         }
         // Deliver block 1 fully (decodes but buffered behind block 0).
         for dg in &b1 {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            receiver.on_symbol(h.block_id, h.esi, p, t0, &budget);
+            receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, t0, &budget);
         }
 
         let link = LinkState::new(
@@ -1357,7 +1423,7 @@ mod tests {
         let mut delivered = Vec::new();
         for dg in &b0 {
             let (h, p) = SymbolHeader::parse(dg).unwrap();
-            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.esi, p, t0, &budget));
+            delivered.extend_from_slice(&receiver.on_symbol(h.block_id, h.actual_k as u32, h.esi, p, t0, &budget));
         }
         assert_eq!(delivered, payload0, "block 0 delivered");
         assert_eq!(receiver.highest_delivered(), 1);
@@ -1502,6 +1568,7 @@ mod tests {
         let hdr = SymbolHeader {
             stream_id: stream,
             block_id: block,
+            actual_k: 6,
             esi,
             flags: raptun_proto::datagram::SymbolFlags::empty(),
         };

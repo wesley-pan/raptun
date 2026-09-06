@@ -35,6 +35,11 @@ impl RepairRatio {
         RepairRatio((clamped * 1_000_000.0) as u32)
     }
 
+    /// Construct from parts-per-thousand (e.g. `150` = 15% overhead).
+    pub fn from_ppm_thousandths(ppm: u16) -> Self {
+        Self::from_fraction(ppm as f64 / 1000.0)
+    }
+
     /// The fraction as an `f64`.
     pub fn as_fraction(self) -> f64 {
         self.0 as f64 / 1_000_000.0

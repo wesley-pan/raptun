@@ -39,6 +39,17 @@ use crate::encoder::{frame_symbol, BlockEncoder, EncodedSymbol};
 /// Size of the length prefix that precedes each block's payload.
 pub const LEN_PREFIX: usize = 4;
 
+/// Compute the source-block size K′ needed to encode a payload of `len` bytes
+/// with the given symbol size, without padding beyond what is necessary.
+pub fn actual_k_for(len: usize, symbol_size: u16, max_k: u32) -> u32 {
+    if len == 0 {
+        return 1;
+    }
+    let total = len.saturating_add(LEN_PREFIX);
+    let k = (total as u64).div_ceil(symbol_size as u64).max(1) as u32;
+    k.min(max_k).max(1)
+}
+
 /// Build the per-block OTI for the given geometry. `source_blocks = 1` because
 /// each Raptun block is coded independently as one RaptorQ source block.
 fn oti_for(symbol_size: u16, k: u32) -> ObjectTransmissionInformation {
@@ -118,11 +129,11 @@ impl BlockEncoder for RaptorQBlockEncoder {
         let mut out = Vec::new();
         // Source symbols: ESI 0..K, is_repair = false.
         for pkt in self.inner.source_packets() {
-            out.push(frame_from_packet(stream_id, block_id, &pkt, false));
+            out.push(frame_from_packet(stream_id, block_id, self.k, &pkt, false));
         }
         // Repair symbols: ESI K.., is_repair = true.
         for pkt in self.inner.repair_packets(0, repair_count) {
-            out.push(frame_from_packet(stream_id, block_id, &pkt, true));
+            out.push(frame_from_packet(stream_id, block_id, self.k, &pkt, true));
         }
         out
     }
@@ -140,7 +151,7 @@ impl BlockEncoder for RaptorQBlockEncoder {
         self.inner
             .repair_packets(already_sent_repair, extra)
             .iter()
-            .map(|pkt| frame_from_packet(stream_id, block_id, pkt, true))
+            .map(|pkt| frame_from_packet(stream_id, block_id, self.k, pkt, true))
             .collect()
     }
 }
@@ -150,11 +161,12 @@ impl BlockEncoder for RaptorQBlockEncoder {
 fn frame_from_packet(
     stream_id: StreamId,
     block_id: BlockId,
+    actual_k: u32,
     pkt: &EncodingPacket,
     is_repair: bool,
 ) -> EncodedSymbol {
     let esi = pkt.payload_id().encoding_symbol_id();
-    frame_symbol(stream_id, block_id, esi, is_repair, pkt.data())
+    frame_symbol(stream_id, block_id, actual_k as u16, esi, is_repair, pkt.data())
 }
 
 /// Production [`RaptorQBlockDecoder`] backed by `raptorq::SourceBlockDecoder`.

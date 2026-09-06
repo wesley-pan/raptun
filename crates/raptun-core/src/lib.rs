@@ -15,8 +15,7 @@
 //!   FEC layer's [`raptun_fec::LinkState`], including the cross-tick congestion
 //!   classifier that the FEC crate deliberately does not compute itself.
 //! * [`session`] — per-connection primitives: control-stream framing, the
-//!   Raptun handshake, bidirectional TCP tunnelling, datagram symbol transport,
-//!   and the telemetry-driven [`session::Session`] control loop.
+//!   Raptun handshake, bidirectional TCP tunnelling, and datagram symbol transport.
 //! * [`run`] — the top-level client and server loops the binaries call.
 //!
 //! Phase-1 status: the reliable-stream tunnel path is fully wired to Quinn
@@ -36,7 +35,7 @@ pub mod tls;
 pub use config::{FecConfig, RuntimeConfig, TransportConfig};
 pub use monitor::{TunnelRegistry, TunnelStats};
 pub use run::{run_client, run_server, ListenMode};
-pub use session::{Role, Session};
+pub use session::Role;
 
 /// Crate-wide error type.
 #[derive(Debug, thiserror::Error)]

@@ -85,7 +85,11 @@ macro_rules! bitflags_lite {
 ///
 /// Bumped on any incompatible change to either wire format. A peer that sees a
 /// version it does not understand must refuse the connection rather than guess.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Version 2 introduces the variable source-block size (`actual_k` in the
+/// datagram header). Peers running version 1 are not interoperable with
+/// version 2 because the header length and semantics changed.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Logical identifier for a source block within a single tunnelled stream.
 ///

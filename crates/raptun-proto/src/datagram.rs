@@ -10,7 +10,7 @@
 //! to attribute a datagram that arrives out of nowhere to the right stream and
 //! the right source block, and know whether it is an original or repair symbol.
 //!
-//! # Layout (16 bytes, big-endian)
+//! # Layout (22 bytes, big-endian)
 //!
 //! ```text
 //!   0               1               2               3
@@ -20,13 +20,19 @@
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //!  |                          block_id (u64)                       |
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//!  |     esi (u24)         | flags (u8)|   ... symbol payload ...
-//!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//!  |         actual_k (u16)        |     esi (u24)         | flags |
+//!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//!  |   ... symbol payload ...
+//!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 //!
-//! `esi` (Encoding Symbol ID) is RaptorQ's own symbol index: values `< K` are
-//! source symbols, values `>= K` are repair symbols. 24 bits is ample — RFC6330
-//! caps a source block at 56403 symbols, far below 2^24.
+//! `actual_k` is the number of source symbols this block was encoded with.
+//! It may be less than the negotiated maximum `K` when the payload is short,
+//! avoiding the bandwidth blow-up of padding a tiny message to a full block.
+//!
+//! `esi` (Encoding Symbol ID) is RaptorQ's own symbol index: values `< actual_k`
+//! are source symbols, values `>= actual_k` are repair symbols. 24 bits is ample
+//! — RFC6330 caps a source block at 56403 symbols, far below 2^24.
 
 use bytes::{Buf, BufMut};
 
@@ -35,7 +41,7 @@ use crate::{BlockId, StreamId};
 
 /// Serialized size of [`SymbolHeader`] in bytes. Kept as a const so the encoder
 /// can subtract it from the datagram MTU to size symbol payloads exactly.
-pub const SYMBOL_HEADER_LEN: usize = 8 + 8 + 3 + 1;
+pub const SYMBOL_HEADER_LEN: usize = 8 + 8 + 2 + 3 + 1;
 
 crate::bitflags_lite! {
     /// Per-symbol flags packed into the header's trailing byte.
@@ -58,7 +64,10 @@ pub struct SymbolHeader {
     pub stream_id: StreamId,
     /// Which source block within that stream.
     pub block_id: BlockId,
-    /// RaptorQ Encoding Symbol ID (source if `< K`, repair if `>= K`).
+    /// Number of source symbols this block was encoded with (may be less than
+    /// the negotiated maximum K for short payloads).
+    pub actual_k: u16,
+    /// RaptorQ Encoding Symbol ID (source if `< actual_k`, repair if `>= actual_k`).
     pub esi: u32,
     /// Classification / hint flags.
     pub flags: SymbolFlags,
@@ -78,6 +87,7 @@ impl Encode for SymbolHeader {
     fn encode(&self, buf: &mut impl BufMut) {
         buf.put_u64(self.stream_id);
         buf.put_u64(self.block_id);
+        buf.put_u16(self.actual_k);
         // esi as u24: write the low 3 bytes, big-endian.
         buf.put_u8((self.esi >> 16) as u8);
         buf.put_u8((self.esi >> 8) as u8);
@@ -91,6 +101,7 @@ impl Decode for SymbolHeader {
         ensure(buf, SYMBOL_HEADER_LEN)?;
         let stream_id = buf.get_u64();
         let block_id = buf.get_u64();
+        let actual_k = buf.get_u16();
         let esi = (u32::from(buf.get_u8()) << 16)
             | (u32::from(buf.get_u8()) << 8)
             | u32::from(buf.get_u8());
@@ -98,6 +109,7 @@ impl Decode for SymbolHeader {
         Ok(Self {
             stream_id,
             block_id,
+            actual_k,
             esi,
             flags,
         })
@@ -113,6 +125,7 @@ mod tests {
         let hdr = SymbolHeader {
             stream_id: 0x0102_0304_0506_0708,
             block_id: 42,
+            actual_k: 7,
             esi: 0x00AB_CDEF & 0x00FF_FFFF, // fits in u24
             flags: SymbolFlags::REPAIR | SymbolFlags::BLOCK_HINT_LAST,
         };

@@ -161,6 +161,7 @@ async fn datagram_hub_caps_distinct_streams_under_attack() {
         let hdr = SymbolHeader {
             stream_id: s,
             block_id: 1,
+            actual_k: 16,
             esi: 0,
             flags: raptun_proto::datagram::SymbolFlags::empty(),
         };

@@ -143,6 +143,7 @@ impl StreamEncoder {
 pub fn frame_symbol(
     stream_id: StreamId,
     block_id: BlockId,
+    actual_k: u16,
     esi: u32,
     is_repair: bool,
     payload: &[u8],
@@ -154,6 +155,7 @@ pub fn frame_symbol(
     let header = SymbolHeader {
         stream_id,
         block_id,
+        actual_k,
         esi,
         flags,
     };
@@ -172,11 +174,13 @@ mod tests {
 
     #[test]
     fn stream_encoder_forms_full_blocks() {
-        // MTU 1200 ⇒ symbol_size = 1200 - 20 = 1180. K = 4 ⇒ block = 4720 bytes.
+        // MTU 1200 ⇒ symbol_size = 1200 - SYMBOL_HEADER_LEN = 1178.
+        // K = 4 ⇒ block = 4712 bytes.
         let mut enc = StreamEncoder::new(7, 1200, 4);
-        assert_eq!(enc.symbol_size(), 1180);
+        let symbol_size = enc.symbol_size();
+        assert_eq!(symbol_size, 1200 - SYMBOL_HEADER_LEN as u16);
 
-        let block_len = 1180 * 4;
+        let block_len = symbol_size as usize * 4;
         let data = vec![0u8; block_len * 2 + 100]; // two full blocks + remainder
         let blocks = enc.push(&data);
         assert_eq!(blocks.len(), 2);
@@ -191,10 +195,11 @@ mod tests {
 
     #[test]
     fn framing_round_trips_through_proto() {
-        let sym = frame_symbol(7, 3, 5, true, b"payload");
+        let sym = frame_symbol(7, 3, 16, 5, true, b"payload");
         let (hdr, payload) = SymbolHeader::parse(&sym.datagram).unwrap();
         assert_eq!(hdr.stream_id, 7);
         assert_eq!(hdr.block_id, 3);
+        assert_eq!(hdr.actual_k, 16);
         assert_eq!(hdr.esi, 5);
         assert!(hdr.flags.contains(SymbolFlags::REPAIR));
         assert_eq!(payload, b"payload");

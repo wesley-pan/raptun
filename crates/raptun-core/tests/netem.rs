@@ -64,6 +64,7 @@ struct InFlight {
     #[allow(dead_code)]
     deliver_at: u64, // virtual ms
     block: u64,
+    actual_k: u32,
     esi: u32,
     payload: Vec<u8>,
 }
@@ -97,7 +98,15 @@ impl Channel {
 
     /// Offer a datagram to the channel at virtual time `now`. Returns whether it
     /// was accepted (not dropped by loss).
-    fn send(&mut self, now: u64, block: u64, esi: u32, payload: Vec<u8>, rng: &mut Rng) -> bool {
+    fn send(
+        &mut self,
+        now: u64,
+        block: u64,
+        actual_k: u32,
+        esi: u32,
+        payload: Vec<u8>,
+        rng: &mut Rng,
+    ) -> bool {
         if rng.unit() < self.loss {
             return false; // lost
         }
@@ -110,6 +119,7 @@ impl Channel {
         self.store.push(Some(InFlight {
             deliver_at: now + delay,
             block,
+            actual_k,
             esi,
             payload,
         }));
@@ -199,7 +209,7 @@ fn run_scenario(
     for chunk in payload.chunks(cap) {
         for dg in sender.encode_one_block(chunk, proactive_repair) {
             let (h, p) = SymbolHeader::parse(&dg).unwrap();
-            data.send(now, h.block_id, h.esi, p.to_vec(), &mut rng);
+            data.send(now, h.block_id, h.actual_k as u32, h.esi, p.to_vec(), &mut rng);
         }
         first_offered.push(now);
         block_done.push(false);
@@ -210,6 +220,7 @@ fn run_scenario(
     sig.send(
         now,
         u64::MAX,
+        0,
         0,
         TunnelSignal::BlockCount {
             total: total_blocks,
@@ -237,6 +248,7 @@ fn run_scenario(
         for item in data.ready(now) {
             let out = receiver.on_symbol(
                 item.block,
+                item.actual_k,
                 item.esi,
                 &item.payload,
                 clock_start + Duration::from_millis(now),
@@ -257,6 +269,7 @@ fn run_scenario(
                     now,
                     block,
                     0,
+                    0,
                     TunnelSignal::BlockAck { block }.encode(),
                     &mut rng,
                 );
@@ -276,7 +289,7 @@ fn run_scenario(
                         // Sender serves the NACK with fresh repair on the data channel.
                         for dg in sender.additional_repair(block, need) {
                             let (h, p) = SymbolHeader::parse(&dg).unwrap();
-                            data.send(now, h.block_id, h.esi, p.to_vec(), &mut rng);
+                            data.send(now, h.block_id, h.actual_k as u32, h.esi, p.to_vec(), &mut rng);
                         }
                     }
                     TunnelSignal::ReliableRequest { block } => {
@@ -285,6 +298,7 @@ fn run_scenario(
                             sig.send(
                                 now,
                                 block,
+                                0,
                                 0,
                                 TunnelSignal::ReliableData { block, bytes }.encode(),
                                 &mut rng,
@@ -307,6 +321,7 @@ fn run_scenario(
                             sig.send(
                                 now,
                                 block,
+                                0,
                                 0,
                                 TunnelSignal::BlockAck { block }.encode(),
                                 &mut rng,
@@ -342,7 +357,7 @@ fn run_scenario(
                 metrics.max_inflight_over_ceiling = frac;
             }
             for s in signals {
-                sig.send(now, 0, 0, s.encode(), &mut rng);
+                sig.send(now, 0, 0, 0, s.encode(), &mut rng);
             }
             // Tick may have detected entirely-lost blocks and completed
             // them via the reliable path; ack those too.
@@ -350,6 +365,7 @@ fn run_scenario(
                 sig.send(
                     now,
                     block,
+                    0,
                     0,
                     TunnelSignal::BlockAck { block }.encode(),
                     &mut rng,

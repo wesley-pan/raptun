@@ -15,18 +15,14 @@
 //! * **Telemetry** — [`read_telemetry`] samples `quinn::Connection` into the
 //!   FEC layer's input shape.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 
-use raptun_fec::budget::RepairBudget;
-use raptun_fec::strategy::FecStrategy;
 use raptun_proto::control::{FecParams, Hello, HelloAck, Message};
 use raptun_proto::{Decode, Encode};
 
 use crate::config::RuntimeConfig;
-use crate::telemetry::{LossTracker, RegimeClassifier, TransportSample};
+use crate::telemetry::{LossTracker, TransportSample};
 use crate::{CoreError, Result};
 
 /// Maximum control message size we will accept, to bound a peer's allocation.
@@ -40,7 +36,11 @@ const MAX_CONTROL_MSG: usize = 64 * 1024;
 /// well under that. The server clamps the negotiated size to this ceiling so
 /// both ends share a geometry that is guaranteed to fit; oversized symbols
 /// would otherwise be silently dropped by `send_datagram`.
-pub const SAFE_MAX_SYMBOL_SIZE: u16 = 1100;
+///
+/// The ceiling is reduced from 1100 to 1098 because the symbol header grew by
+/// 2 bytes (`actual_k`), keeping the maximum framed symbol size unchanged at
+/// ~1120 bytes.
+pub const SAFE_MAX_SYMBOL_SIZE: u16 = 1098;
 
 /// Application error code used when closing a connection cleanly.
 pub const CLOSE_OK: u32 = 0;
@@ -400,82 +400,6 @@ pub fn read_telemetry(conn: &Connection, tracker: &mut LossTracker) -> Transport
         rtt_var: conn.rtt() / 2,
         cwnd_bytes: path.cwnd,
         loss_rate,
-    }
-}
-
-/// A live Raptun session over one established QUIC connection.
-///
-/// Owns the shared FEC state (adaptive strategy + repair budget + congestion
-/// classifier). The per-connection run loops (`control_tick`, datagram pump,
-/// tunnel accept) drive these; construction wires them together.
-pub struct Session {
-    role: Role,
-    config: RuntimeConfig,
-    conn: Connection,
-    strategy: FecStrategy,
-    budget: Arc<RepairBudget>,
-    classifier: RegimeClassifier,
-    loss_tracker: LossTracker,
-    /// Effective FEC params after handshake negotiation.
-    fec: FecParams,
-}
-
-impl Session {
-    /// Build a session around an established connection and negotiated params.
-    pub fn new(role: Role, config: RuntimeConfig, conn: Connection, fec: FecParams) -> Self {
-        let strategy = FecStrategy::new(config.fec.strategy, config.fec.initial_ratio);
-        let budget = Arc::new(RepairBudget::new(
-            config.fec.symbol_size,
-            config.fec.repair_cwnd_fraction,
-        ));
-        Self {
-            role,
-            config,
-            conn,
-            strategy,
-            budget,
-            classifier: RegimeClassifier::new(),
-            loss_tracker: LossTracker::new(),
-            fec,
-        }
-    }
-
-    pub fn role(&self) -> Role {
-        self.role
-    }
-
-    /// The resolved runtime configuration this session runs under.
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.config
-    }
-
-    pub fn connection(&self) -> &Connection {
-        &self.conn
-    }
-
-    pub fn negotiated_fec(&self) -> &FecParams {
-        &self.fec
-    }
-
-    pub fn repair_budget(&self) -> &Arc<RepairBudget> {
-        &self.budget
-    }
-
-    /// One iteration of the control loop: sample telemetry, refresh the repair
-    /// budget ceiling from the live cwnd, and update the adaptive strategy.
-    ///
-    /// Returns `true` if the repair ratio changed enough to warrant announcing a
-    /// [`Message::FecReconfig`] to the peer.
-    pub fn control_tick(&mut self) -> bool {
-        let sample = read_telemetry(&self.conn, &mut self.loss_tracker);
-        let link = self.classifier.to_link_state(sample);
-        self.budget.refresh_ceiling(link.cwnd_bytes());
-        self.strategy.update(&link)
-    }
-
-    /// Close the connection cleanly.
-    pub fn close(&self) {
-        self.conn.close(CLOSE_OK.into(), b"bye");
     }
 }
 
